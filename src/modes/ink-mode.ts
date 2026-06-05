@@ -50,6 +50,7 @@ export async function startInkRepl(options: ReplOptions): Promise<void> {
   const runtime = await assembleRuntime({
     model: options.model ?? DEFAULT_MODEL,
     systemPrompt: options.systemPrompt,
+    appendSystemPrompt: options.appendSystemPrompt,
     permissionMode: options.permissionMode ?? 'default',
     maxTokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
     temperature: options.temperature,

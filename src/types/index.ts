@@ -109,6 +109,8 @@ export interface PermissionContext {
   permissionMode: PermissionMode
   allowList: string[]
   denyList: string[]
+  /** Working directory for path resolution in permission checks. */
+  cwd: string
 }
 
 export type PermissionMode = 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan'

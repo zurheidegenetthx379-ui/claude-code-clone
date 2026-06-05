@@ -27,11 +27,14 @@ export async function runHeadless(options: HeadlessOptions): Promise<void> {
   const runtime = await assembleRuntime({
     model: options.model ?? DEFAULT_MODEL,
     systemPrompt: options.systemPrompt,
+    appendSystemPrompt: options.appendSystemPrompt,
     permissionMode: options.permissionMode ?? 'default',
     maxTokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
     temperature: options.temperature,
     cwd: options.cwd,
     mcpConfigs: [],
+    allowList: options.allowList,
+    denyList: options.denyList,
   })
 
   const engine = createQueryEngine(runtime, { silent: true, isInteractive: false })

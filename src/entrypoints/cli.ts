@@ -179,11 +179,14 @@ async function runHeadless(args: string[]): Promise<void> {
     prompt,
     model: options.model,
     systemPrompt: options.systemPrompt,
+    appendSystemPrompt: options.appendSystemPrompt,
     permissionMode: options.permissionMode,
     maxTokens: options.maxTokens,
     temperature: options.temperature,
     cwd: options.cwd || process.cwd(),
     outputFormat: 'text',
+    allowList: options.allowList,
+    denyList: options.denyList,
   })
   process.exit(0)
 }
@@ -197,10 +200,13 @@ async function runSdkMode(args: string[]): Promise<void> {
   await runSdkModeMain({
     model: options.model,
     systemPrompt: options.systemPrompt,
+    appendSystemPrompt: options.appendSystemPrompt,
     permissionMode: options.permissionMode,
     maxTokens: options.maxTokens,
     temperature: options.temperature,
     cwd: options.cwd || process.cwd(),
+    allowList: options.allowList,
+    denyList: options.denyList,
   })
   process.exit(0)
 }
@@ -212,6 +218,7 @@ async function runSdkMode(args: string[]): Promise<void> {
 interface ParsedOptions {
   model?: string
   systemPrompt?: string
+  appendSystemPrompt?: string
   permissionMode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan'
   maxTokens?: number
   temperature?: number
@@ -234,6 +241,8 @@ function parseOptions(args: string[]): ParsedOptions {
       options.model = args[++i]
     } else if (arg === '--system-prompt' && args[i + 1]) {
       options.systemPrompt = args[++i]
+    } else if (arg === '--append-system-prompt' && args[i + 1]) {
+      options.appendSystemPrompt = args[++i]
     } else if (arg === '--permission-mode' && args[i + 1]) {
       const mode = args[++i]
       if (['default', 'acceptEdits', 'bypassPermissions', 'plan'].includes(mode)) {
@@ -327,6 +336,7 @@ async function main(): Promise<void> {
       initialPrompt: options.prompt,
       model: options.model,
       systemPrompt: options.systemPrompt,
+      appendSystemPrompt: options.appendSystemPrompt,
       permissionMode: options.permissionMode,
       maxTokens: options.maxTokens,
       temperature: options.temperature,
@@ -344,6 +354,7 @@ async function main(): Promise<void> {
       initialPrompt: options.prompt,
       model: options.model,
       systemPrompt: options.systemPrompt,
+      appendSystemPrompt: options.appendSystemPrompt,
       permissionMode: options.permissionMode,
       maxTokens: options.maxTokens,
       temperature: options.temperature,

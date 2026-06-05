@@ -4,6 +4,7 @@
  */
 
 import type { ContextWindowConfig } from '../types/index.js'
+import { estimateTokenCount } from '../services/compact/compact.js'
 
 // Default context window sizes
 export const MODEL_CONTEXT_WINDOW_DEFAULT = 200_000
@@ -60,10 +61,12 @@ export function getDefaultContextConfig(model: string): ContextWindowConfig {
 }
 
 /**
- * Rough token estimation from text (1 token ≈ 4 characters for English)
+ * Token estimation with CJK awareness.
+ * Delegates to the CJK-aware estimator in the compact service for accurate
+ * estimation across ASCII and CJK text.
  */
 export function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4)
+  return estimateTokenCount(text)
 }
 
 /**

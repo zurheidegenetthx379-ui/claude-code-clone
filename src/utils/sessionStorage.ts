@@ -36,6 +36,7 @@ import {
   open,
   readFile,
   stat,
+  unlink,
   writeFile,
 } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
@@ -459,6 +460,15 @@ export async function drainWriteQueue(): Promise<void> {
 /**
  * Write a batch of serialized lines to a single file, creating the file
  * and its parent directories if necessary.
+ *
+ * Uses a Write-Ahead Log (WAL) for crash safety:
+ *   1. Write the payload to a `.wal` sidecar file first.
+ *   2. Append the payload to the main transcript file.
+ *   3. Delete the WAL file (best-effort cleanup).
+ *
+ * If the process crashes between steps 2 and 3, the WAL file survives.
+ * On next load, {@link recoverWAL} replays the WAL content into the main
+ * file before reading, ensuring no data is lost.
  */
 async function writeGroupedEntries(filePath: string, lines: string[]): Promise<void> {
   const payload = lines.join('')
@@ -470,9 +480,11 @@ async function writeGroupedEntries(filePath: string, lines: string[]): Promise<v
     ensuredDirectories.add(filePath)
   }
 
-  // Append to the file with restrictive permissions.
-  // `appendFile` creates the file if it does not exist, but does not set
-  // permissions on creation, so we handle that explicitly.
+  // ---- WAL: Step 1 — write to WAL first ----
+  const walPath = filePath + '.wal'
+  await writeFile(walPath, payload, { encoding: 'utf-8', mode: FILE_PERMISSIONS })
+
+  // ---- WAL: Step 2 — append to main file ----
   try {
     await appendFile(filePath, payload, { encoding: 'utf-8', mode: FILE_PERMISSIONS })
   } catch (err: unknown) {
@@ -483,6 +495,14 @@ async function writeGroupedEntries(filePath: string, lines: string[]): Promise<v
     } else {
       throw err
     }
+  }
+
+  // ---- WAL: Step 3 — clean up WAL (best-effort) ----
+  try {
+    await unlink(walPath)
+  } catch {
+    // Best-effort cleanup. If this fails, recoverWAL will handle it on
+    // the next load.
   }
 }
 
@@ -528,6 +548,55 @@ export function deduplicateByUuid(
 }
 
 // ============================================================
+// WAL Recovery
+// ============================================================
+
+/**
+ * Recover any pending Write-Ahead Log (WAL) data before reading a transcript.
+ *
+ * If a prior process crashed after writing the WAL but before cleaning it up,
+ * the WAL file will still exist. This function:
+ *   1. Checks for a `.wal` sidecar file next to the main transcript.
+ *   2. If found, appends its content to the main transcript file (idempotent
+ *      because the WAL was written *before* the main-file append, so the
+ *      main file may or may not already contain the WAL data).
+ *   3. Deletes the WAL file.
+ *
+ * The potential for duplicate lines (if the main-file append succeeded but
+ * the WAL cleanup failed) is handled gracefully: the transcript loader's
+ * UUID deduplication (latest-writer-wins) resolves any duplicate entries.
+ *
+ * @param filePath — absolute path to the main `.jsonl` transcript file.
+ */
+export async function recoverWAL(filePath: string): Promise<void> {
+  const walPath = filePath + '.wal'
+  try {
+    const walContent = await readFile(walPath, 'utf-8')
+    if (walContent.trim()) {
+      // Ensure the parent directory exists before appending.
+      const dir = dirname(filePath)
+      await mkdir(dir, { recursive: true, mode: DIR_PERMISSIONS })
+
+      try {
+        await appendFile(filePath, walContent, { encoding: 'utf-8', mode: FILE_PERMISSIONS })
+      } catch (err: unknown) {
+        const code = (err as NodeJS.ErrnoException).code
+        if (code === 'ENOENT') {
+          // Main file doesn't exist yet — create it with the WAL content.
+          await writeFile(filePath, walContent, { encoding: 'utf-8', mode: FILE_PERMISSIONS })
+        } else {
+          throw err
+        }
+      }
+    }
+    // Clean up the WAL file after successful replay.
+    await unlink(walPath)
+  } catch {
+    // No WAL file exists, or it was already cleaned up — nothing to do.
+  }
+}
+
+// ============================================================
 // Load Transcript File — Full Recovery
 // ============================================================
 
@@ -555,6 +624,9 @@ export function deduplicateByUuid(
  * @returns Parsed and reconstructed conversation data.
  */
 export async function loadTranscriptFile(filePath: string): Promise<TranscriptLoadResult> {
+  // ---- WAL recovery: replay any pending WAL before reading ----
+  await recoverWAL(filePath)
+
   const raw = await readFile(filePath, 'utf-8')
   const lines = raw.split('\n').filter((l) => l.trim().length > 0)
 

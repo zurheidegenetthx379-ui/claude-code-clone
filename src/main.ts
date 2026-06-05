@@ -155,8 +155,10 @@ export interface HeadlessOptions {
   prompt: string
   /** Model override. */
   model?: string
-  /** System prompt override. */
+  /** System prompt override (replaces default prompt entirely). */
   systemPrompt?: string
+  /** Text appended AFTER the selected base system prompt. */
+  appendSystemPrompt?: string
   /** Permission mode. */
   permissionMode?: PermissionMode
   /** Maximum output tokens. */
@@ -167,13 +169,19 @@ export interface HeadlessOptions {
   cwd: string
   /** Output format — currently only "text" is supported. */
   outputFormat?: 'text' | 'json'
+  /** Permission allow-list patterns. */
+  allowList?: string[]
+  /** Permission deny-list patterns. */
+  denyList?: string[]
 }
 
 export interface SdkModeOptions {
   /** Model override. */
   model?: string
-  /** System prompt override. */
+  /** System prompt override (replaces default prompt entirely). */
   systemPrompt?: string
+  /** Text appended AFTER the selected base system prompt. */
+  appendSystemPrompt?: string
   /** Permission mode. */
   permissionMode?: PermissionMode
   /** Maximum output tokens. */
@@ -182,6 +190,10 @@ export interface SdkModeOptions {
   temperature?: number
   /** Working directory. */
   cwd: string
+  /** Permission allow-list patterns. */
+  allowList?: string[]
+  /** Permission deny-list patterns. */
+  denyList?: string[]
 }
 
 export interface ReplOptions {
@@ -189,8 +201,10 @@ export interface ReplOptions {
   initialPrompt?: string
   /** Model override. */
   model?: string
-  /** System prompt override. */
+  /** System prompt override (replaces default prompt entirely). */
   systemPrompt?: string
+  /** Text appended AFTER the selected base system prompt. */
+  appendSystemPrompt?: string
   /** Permission mode. */
   permissionMode?: PermissionMode
   /** Maximum output tokens. */
@@ -314,7 +328,7 @@ export async function main(argv: string[]): Promise<void> {
   const maxTokens = parseInt(extractArg(argv, '--max-tokens') ?? '', 10) || undefined
   const temperature = parseFloat(extractArg(argv, '--temperature') ?? '') || undefined
 
-  const fullSystemPrompt = buildFullSystemPrompt(systemPrompt, appendSystemPrompt)
+  const fullSystemPrompt = buildFullSystemPrompt(systemPrompt)
 
   // Import mode functions locally to avoid circular import issues at module
   // evaluation time.  By the time main() is called all modules are fully
@@ -331,6 +345,7 @@ export async function main(argv: string[]): Promise<void> {
         prompt,
         model,
         systemPrompt: fullSystemPrompt,
+        appendSystemPrompt,
         permissionMode,
         maxTokens,
         temperature,
@@ -342,6 +357,7 @@ export async function main(argv: string[]): Promise<void> {
         initialPrompt: argv.find(a => !a.startsWith('-')),
         model,
         systemPrompt: fullSystemPrompt,
+        appendSystemPrompt,
         permissionMode,
         maxTokens,
         temperature,
@@ -374,6 +390,7 @@ export async function main(argv: string[]): Promise<void> {
 export async function assembleRuntime(options: {
   model: string
   systemPrompt?: string
+  appendSystemPrompt?: string
   permissionMode: PermissionMode
   maxTokens: number
   temperature?: number
@@ -423,6 +440,7 @@ export async function assembleRuntime(options: {
     permissionMode: effectivePermissionMode,
     allowList: options.allowList ?? [],
     denyList: options.denyList ?? [],
+    cwd: cwd,
   }
 
   // ---- Built-in tools ----
@@ -448,7 +466,22 @@ export async function assembleRuntime(options: {
     additionalDirs: options.additionalDirs,
   })
 
-  // ---- System prompt ----
+  // ---- System prompt assembly ----
+  //
+  // Semantics:
+  //   1. Base prompt = options.systemPrompt (full override via --system-prompt)
+  //                   OR buildEffectiveSystemPrompt() (coordinator > default)
+  //   2. If projectSettings.systemPrompt exists, APPEND it to the base
+  //   3. If options.appendSystemPrompt exists (--append-system-prompt), APPEND it
+  //   4. Context and memory blocks are appended last
+  //
+  // --system-prompt and --append-system-prompt are non-overlapping:
+  //   - --system-prompt REPLACES the default system prompt entirely
+  //   - --append-system-prompt is appended AFTER whatever base was selected
+  //   - They do NOT both try to set the base prompt
+  //
+  // projectSettings.systemPrompt (from .cc-agent/settings.json) is ALWAYS
+  // appended (never replaces the default).
   const coordinatorMode = isCoordinatorMode()
   const effectiveSystemPrompt = await buildEffectiveSystemPrompt({
     tools: filteredTools,
@@ -456,13 +489,19 @@ export async function assembleRuntime(options: {
     overrideSystemPrompt: options.systemPrompt,
     coordinatorSystemPrompt: coordinatorMode ? getCoordinatorSystemPrompt() : undefined,
     isCoordinatorMode: coordinatorMode,
-    customSystemPrompt: projectSettings.systemPrompt,
+    // projectSettings.systemPrompt is appended below, NOT passed here as
+    // customSystemPrompt (which would REPLACE the default prompt).
   })
   let systemPrompt = effectiveSystemPrompt.content
 
-  // Apply project settings' system prompt addition (if provided).
+  // Append project-level system prompt from .cc-agent/settings.json.
   if (projectSettings.systemPrompt) {
     systemPrompt = systemPrompt + '\n\n' + projectSettings.systemPrompt
+  }
+
+  // Append --append-system-prompt AFTER the base + project settings.
+  if (options.appendSystemPrompt) {
+    systemPrompt = systemPrompt + '\n\n' + options.appendSystemPrompt
   }
 
   // ---- Context injection (from context.ts) ----
@@ -582,7 +621,12 @@ export async function assembleRuntime(options: {
  */
 export function createQueryEngine(
   runtime: AssembledRuntime,
-  options: { silent?: boolean; fullySilent?: boolean; isInteractive?: boolean } = {},
+  options: {
+    silent?: boolean
+    fullySilent?: boolean
+    isInteractive?: boolean
+    approvalCallback?: (toolName: string, input: Record<string, unknown>) => Promise<boolean>
+  } = {},
 ): QueryEngine {
   const config: QueryEngineConfig = {
     model: runtime.model,
@@ -596,6 +640,9 @@ export function createQueryEngine(
     // Headless and SDK modes default to non-interactive, which causes
     // tools returning `{ behavior: 'ask' }` to be denied automatically.
     isInteractive: options.isInteractive ?? false,
+    // Approval callback for interactive mode — used when tools return
+    // `{ behavior: 'ask' }` to request user confirmation.
+    approvalCallback: options.approvalCallback,
     // Inject sandbox and swarm infrastructure into appState so tools
     // (AgentTool in particular) can access the registries at invocation time.
     sandboxState: {
@@ -954,17 +1001,28 @@ export async function handleCommand(
 // ============================================================
 
 /**
- * Compose the full system prompt from the base and optional appendage.
+ * Passthrough for the `--system-prompt` CLI flag.
+ *
+ * System prompt assembly (in assembleRuntime):
+ *   1. Base prompt = options.systemPrompt (full override via --system-prompt)
+ *                   OR buildEffectiveSystemPrompt() (coordinator > default)
+ *   2. If projectSettings.systemPrompt exists, it is APPENDED to the base
+ *   3. If options.appendSystemPrompt exists (--append-system-prompt), it is
+ *      APPENDED AFTER the base
+ *   4. Context and memory blocks are appended last
+ *
+ * --system-prompt and --append-system-prompt are non-overlapping:
+ *   - --system-prompt REPLACES the default system prompt entirely
+ *   - --append-system-prompt is appended AFTER whatever base was selected
+ *   - They do NOT both try to set the base prompt
  */
 function buildFullSystemPrompt(
-  base?: string,
-  append?: string,
+  override?: string,
 ): string | undefined {
-  if (!base && !append) return undefined
-  const parts: string[] = []
-  if (base) parts.push(base)
-  if (append) parts.push(append)
-  return parts.join('\n\n')
+  // Return the --system-prompt override as-is.
+  // When set, it replaces the default prompt in buildEffectiveSystemPrompt.
+  // The --append-system-prompt flag is handled separately in assembleRuntime.
+  return override
 }
 
 // ============================================================

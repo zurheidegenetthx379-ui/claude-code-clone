@@ -62,6 +62,7 @@ export async function startRepl(options: ReplOptions): Promise<void> {
   const runtime = await assembleRuntime({
     model: options.model ?? DEFAULT_MODEL,
     systemPrompt: options.systemPrompt,
+    appendSystemPrompt: options.appendSystemPrompt,
     permissionMode: options.permissionMode ?? 'default',
     maxTokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
     temperature: options.temperature,
@@ -73,7 +74,33 @@ export async function startRepl(options: ReplOptions): Promise<void> {
     denyList: options.denyList,
   })
 
-  let engine = createQueryEngine(runtime, { isInteractive: true })
+  // ---- Readline setup (created early so the approval callback can use it) ----
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    prompt: '> ',
+    historySize: 200,
+  })
+
+  // ---- Approval callback for interactive tool confirmation ----
+  const approvalCallback = async (toolName: string, input: Record<string, unknown>): Promise<boolean> => {
+    return new Promise<boolean>((resolve) => {
+      const summary = JSON.stringify(input).slice(0, 200)
+      rl.pause()
+      process.stdout.write(`\nTool "${toolName}" needs your approval.\n  Input: ${summary}\n  Approve? (y/n): `)
+
+      const onLine = (answer: string) => {
+        const approved = answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes'
+        rl.removeListener('line', onLine)
+        resolve(approved)
+        rl.resume()
+        rl.prompt()
+      }
+      rl.on('line', onLine)
+    })
+  }
+
+  let engine = createQueryEngine(runtime, { isInteractive: true, approvalCallback })
 
   // Register for signal-based cleanup.
   registerSignalHandlers(runtime, engine, null)
@@ -128,14 +155,6 @@ export async function startRepl(options: ReplOptions): Promise<void> {
   console.log(`  Coordinator: ${runtime.coordinatorMode ? 'ACTIVE' : 'inactive'}`)
   console.log('')
 
-  // ---- Readline setup ----
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    prompt: '> ',
-    historySize: 200,
-  })
-
   rl.prompt()
 
   // Handle initial prompt if provided.
@@ -171,7 +190,7 @@ export async function startRepl(options: ReplOptions): Promise<void> {
             // After /clear, /compact, or /resume, recreate the engine with
             // fresh state.  If history messages were returned (e.g. /resume),
             // load them into the new engine.
-            engine = createQueryEngine(runtime, { isInteractive: true })
+            engine = createQueryEngine(runtime, { isInteractive: true, approvalCallback })
             if (result.historyMessages && result.historyMessages.length > 0) {
               engine.loadHistory(result.historyMessages)
             }

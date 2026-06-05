@@ -15,6 +15,7 @@
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { buildTool } from '../../Tool.js'
+import { checkPathAccessSync } from '../../utils/PathPolicy.js'
 import type {
   ToolResult,
   ToolUseContext,
@@ -171,6 +172,20 @@ const BashTool = buildTool({
       return { behavior: 'deny', message: 'Command matches a deny-list entry.' }
     }
 
+    // Enforce path boundaries — best-effort extraction of file paths from the
+    // command string.  Applied before mode-based shortcuts so protected paths
+    // (.git, .env, etc.) are always blocked regardless of permission mode.
+    const pathLikeTokens = command.match(/(?:^|\s)(\/[\w./-]+|[A-Z]:\\[\w.\\/-]+|\.\.?\/[\w./-]+)/gi) ?? []
+    for (const token of pathLikeTokens) {
+      const pathCheck = checkPathAccessSync(token.trim(), {
+        cwd: (context as unknown as { cwd?: string }).cwd ?? process.cwd(),
+        allowOutsideCwd: context.permissionMode === 'bypassPermissions',
+      })
+      if (!pathCheck.allowed) {
+        return { behavior: 'deny', message: `Bash command accesses protected path: ${pathCheck.reason}` }
+      }
+    }
+
     // Allow-list grants automatic approval
     if (context.allowList.some((pattern) =>
       minimatch(firstToken, pattern) || minimatch(command, pattern),
@@ -200,6 +215,28 @@ const BashTool = buildTool({
       return {
         content: 'Error: `command` is required and must be a non-empty string.',
         isError: true,
+      }
+    }
+
+    // ── Dangerous command patterns ──────────────────────────────────────────
+    // Block commands that match known destructive patterns.  This is a
+    // best-effort safety net — not a substitute for proper sandboxing.
+    const DANGEROUS_PATTERNS = [
+      /\brm\s+(-\w*\s+)*-?\w*r\w*\s+(-\w*\s+)*\//,  // rm -rf /
+      /\bmkfs\b/,
+      /\bdd\s+.*of=\/dev\//,
+      /:(){ :\|:& };:/, // fork bomb
+      /\bchmod\s+-R\s+777\s+\//,
+      /\bcurl\b.*\|\s*(ba)?sh\b/,  // curl | sh
+      /\bwget\b.*\|\s*(ba)?sh\b/,  // wget | sh
+    ]
+
+    for (const pattern of DANGEROUS_PATTERNS) {
+      if (pattern.test(command)) {
+        return {
+          content: `Command blocked by safety policy: matches dangerous pattern ${pattern}`,
+          isError: true,
+        }
       }
     }
 

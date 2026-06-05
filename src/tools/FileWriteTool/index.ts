@@ -81,7 +81,7 @@ const FileWriteTool = buildTool({
     // Applied before mode-based shortcuts so protected paths (.git, .env, etc.)
     // are always blocked regardless of permission mode.
     const pathCheck = checkPathAccessSync(filePath, {
-      cwd: (context as unknown as { cwd?: string }).cwd ?? process.cwd(),
+      cwd: context.cwd,
       allowOutsideCwd: context.permissionMode === 'bypassPermissions',
     })
     if (!pathCheck.allowed) {

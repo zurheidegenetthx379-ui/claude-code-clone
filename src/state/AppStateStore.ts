@@ -71,6 +71,7 @@ function createDefaultAppState(): AppState {
       permissionMode: 'default',
       allowList: [],
       denyList: [],
+      cwd: process.cwd(),
     },
     tools: [],
     mcpClients: new Map(),

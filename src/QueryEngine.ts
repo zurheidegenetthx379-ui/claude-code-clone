@@ -30,16 +30,14 @@ import type {
   PermissionContext,
   PermissionResult,
   ToolInstance,
-  ToolResult,
   ToolResultBlock,
   ToolUseBlock,
   ToolUseContext,
-  CanUseTool,
 } from './types/index.js'
 import {
-  runHooks,
-  aggregateHookResults,
-} from './services/hooks/hookRunner.js'
+  executeToolCall,
+  buildPermissionChecker,
+} from './utils/toolExecutor.js'
 
 // ============================================================
 // Event Types
@@ -62,6 +60,8 @@ export interface QueryEngineEvents {
   'tool:result': (toolResult: ToolResultBlock) => void
   /** The model produced an extended-thinking block. */
   thinking: (content: string) => void
+  /** A tool requires user approval before execution. */
+  'tool:approval_needed': (info: { toolUseId: string; toolName: string; input: Record<string, unknown> }) => void
   /** An error occurred during execution. */
   error: (error: Error) => void
   /** The query cycle completed (successfully or not). */
@@ -135,13 +135,19 @@ export interface QueryEngineConfig {
    * Whether the engine is running in an interactive mode (TTY / REPL).
    * When `false` (default), tools that return `{ behavior: 'ask' }` are
    * treated as denied because there is no user present to confirm.
-   * When `true`, `ask` results are auto-allowed for now.
+   * When `true`, `ask` results are resolved via `approvalCallback`.
    *
    * TODO: In interactive mode, `ask` should emit a `tool:approval_needed`
    * event and pause execution until the REPL layer collects user confirmation.
    * This wiring is a separate concern and not yet implemented.
    */
   isInteractive?: boolean
+  /**
+   * Callback to request user approval for tools that return 'ask'.
+   * Should return true if approved, false if denied.
+   * Required when `isInteractive` is true for proper approval flow.
+   */
+  approvalCallback?: (toolName: string, input: Record<string, unknown>) => Promise<boolean>
 }
 
 export interface QueryEngineState {
@@ -764,6 +770,22 @@ export class QueryEngine {
         continue
       }
 
+      // In interactive mode, 'ask' requires user approval via callback.
+      if (perm?.behavior === 'ask' && this.config.isInteractive) {
+        this.emit('tool:approval_needed', { toolUseId: block.id, toolName: block.name, input: block.input })
+        if (this.config.approvalCallback) {
+          const approved = await this.config.approvalCallback(block.name, block.input)
+          if (!approved) {
+            results.push(this.errorResult(block.id, `User denied tool "${block.name}"`))
+            i++
+            continue
+          }
+        } else {
+          // No callback registered — auto-allow for backward compatibility
+          console.error(`[warn] Tool "${block.name}" requires approval but no callback registered, auto-allowing`)
+        }
+      }
+
       const tool = this.findTool(block.name)
       if (!tool) {
         results.push(this.errorResult(block.id, `Unknown tool: "${block.name}"`))
@@ -782,6 +804,8 @@ export class QueryEngine {
           if (nextPerm?.behavior === 'deny') break
           // Stop at ask-in-non-interactive — same treatment as deny.
           if (nextPerm?.behavior === 'ask' && !this.config.isInteractive) break
+          // Stop at ask-in-interactive — requires sequential user approval.
+          if (nextPerm?.behavior === 'ask' && this.config.isInteractive) break
           const nextTool = this.findTool(nextBlock.name)
           if (!nextTool || !nextTool.isConcurrencySafe(nextBlock.input)) break
           batch.push({ block: nextBlock, tool: nextTool })
@@ -816,6 +840,15 @@ export class QueryEngine {
 
   /**
    * Run permission checks for every tool call in the batch.
+   *
+   * Precedence:
+   *   1. Deny-list ALWAYS wins (checked first).
+   *   2. The tool's own `checkPermissions` is ALWAYS invoked.
+   *   3. If the tool says "deny", we respect it regardless of allowList.
+   *   4. If the tool says "ask" and the tool is on the allowList, we
+   *      upgrade to "allow" (allowList can skip "asking" but cannot
+   *      override "denying").
+   *   5. Otherwise the tool's own verdict is used as-is.
    */
   private async checkToolPermissions(
     toolUseBlocks: ToolUseBlock[],
@@ -833,7 +866,7 @@ export class QueryEngine {
         continue
       }
 
-      // Explicit deny-list check
+      // 1. Deny-list ALWAYS wins — checked first
       if (this.config.permissionContext.denyList.includes(tool.name)) {
         results.set(block.id, {
           behavior: 'deny',
@@ -842,32 +875,50 @@ export class QueryEngine {
         continue
       }
 
-      // Explicit allow-list check
-      if (this.config.permissionContext.allowList.includes(tool.name)) {
-        results.set(block.id, { behavior: 'allow' })
-        continue
-      }
-
-      // Delegate to the tool's own permission logic
+      // 2. ALWAYS run the tool's own checkPermissions
+      let toolPerm: PermissionResult
       try {
-        const result = await tool.checkPermissions(
+        toolPerm = await tool.checkPermissions(
           block.input,
           this.config.permissionContext,
         )
-        results.set(block.id, result)
       } catch (err) {
         results.set(block.id, {
           behavior: 'deny',
           message: `Permission check failed: ${err instanceof Error ? err.message : String(err)}`,
         })
+        continue
       }
+
+      // 3. Tool says deny → respect it, regardless of allowList
+      if (toolPerm.behavior === 'deny') {
+        results.set(block.id, toolPerm)
+        continue
+      }
+
+      // 4. Tool says ask + allowList includes tool → upgrade to allow
+      //    (allowList can skip "asking" but CANNOT override "denying")
+      if (toolPerm.behavior === 'ask' && this.config.permissionContext.allowList.includes(tool.name)) {
+        results.set(block.id, { behavior: 'allow' })
+        continue
+      }
+
+      // 5. Use tool's verdict as-is
+      results.set(block.id, toolPerm)
     }
 
     return results
   }
 
   /**
-   * Execute a single tool call and return the result block.
+   * Execute a single tool call by delegating to the shared `executeToolCall`
+   * function in `utils/toolExecutor.ts`.
+   *
+   * The QueryEngine wraps the shared executor with:
+   *   - `tool:use` event emission before execution
+   *   - `tool:result` event emission after execution
+   *   - A progress callback that triggers state-update events
+   *   - The QueryEngine's own tool context (with sub-agent factory, etc.)
    */
   private async executeSingleTool(
     block: ToolUseBlock,
@@ -878,77 +929,26 @@ export class QueryEngine {
 
     const context = this.buildToolContext()
 
-    const canUseTool: CanUseTool = async (_t, input) =>
-      tool.checkPermissions(input, this.config.permissionContext)
+    // Build a permission checker that applies deny/allow-list rules
+    // before delegating to the tool's own checkPermissions.
+    const canUseTool = buildPermissionChecker(this.config.permissionContext)
 
-    // ---- PreToolUse hooks ----
-    let toolInput = { ...block.input }
     const hooks = this.config.hooks ?? []
-    if (hooks.length > 0) {
-      try {
-        const hookResults = await runHooks(
-          hooks,
-          'PreToolUse',
-          { toolName: block.name, input: toolInput },
-          this.config.cwd,
-        )
-        const aggregated = aggregateHookResults(hookResults)
-        if (aggregated.decision === 'deny') {
-          return this.errorResult(
-            block.id,
-            aggregated.message ?? `Tool "${block.name}" denied by hook`,
-          )
-        }
-        if (aggregated.modifiedInput) {
-          toolInput = { ...toolInput, ...aggregated.modifiedInput }
-        }
-      } catch (err) {
-        // Hook execution failure must not crash the main process
-        console.error(
-          `[hooks] PreToolUse hook error: ${err instanceof Error ? err.message : String(err)}`,
-        )
-      }
-    }
 
-    const result: ToolResult = await tool.call(
-      toolInput,
+    const resultBlock = await executeToolCall(
+      block,
+      tool,
       context,
-      canUseTool,
       parentMessage,
-      _progress => {
-        this.emit('state', { ...this.state })
+      canUseTool,
+      hooks,
+      {
+        checkEnabled: true,
+        onProgress: (_progress) => {
+          this.emit('state', { ...this.state })
+        },
       },
     )
-
-    const resultBlock: ToolResultBlock = {
-      type: 'tool_result',
-      tool_use_id: block.id,
-      content:
-        result.content ??
-        (typeof result.output === 'string'
-          ? result.output
-          : JSON.stringify(result.output)),
-      is_error: result.isError,
-    }
-
-    // ---- PostToolUse hooks (informational, results don't affect flow) ----
-    if (hooks.length > 0) {
-      try {
-        const outputStr = typeof resultBlock.content === 'string'
-          ? resultBlock.content
-          : '[complex result]'
-        await runHooks(
-          hooks,
-          'PostToolUse',
-          { toolName: block.name, output: outputStr },
-          this.config.cwd,
-        )
-      } catch (err) {
-        console.error(
-          `[hooks] PostToolUse hook error: ${err instanceof Error ? err.message : String(err)}`,
-        )
-      }
-    }
 
     this.emit('tool:result', resultBlock)
     return resultBlock

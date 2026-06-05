@@ -142,7 +142,7 @@ const FileReadTool = buildTool({
 
     // Enforce path boundaries (protected paths, cwd containment).
     const pathCheck = checkPathAccessSync(filePath, {
-      cwd: (context as unknown as { cwd?: string }).cwd ?? process.cwd(),
+      cwd: context.cwd,
       allowOutsideCwd: context.permissionMode === 'bypassPermissions',
     })
     if (!pathCheck.allowed) {

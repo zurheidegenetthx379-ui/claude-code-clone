@@ -22,7 +22,6 @@ import type {
   StreamEvent,
   QueryOptions,
   ToolInstance,
-  ToolResult,
   ToolUseContext,
   CanUseTool,
 } from './types/index.js'
@@ -33,6 +32,8 @@ import {
   getEffectiveContextWindowSize,
   AUTOCOMPACT_BUFFER_TOKENS,
 } from './utils/context.js'
+
+import { executeToolCall } from './utils/toolExecutor.js'
 
 // ============================================================
 // ID Generation
@@ -313,18 +314,12 @@ interface ToolExecutionResult {
 }
 
 /**
- * Execute a single tool_use block through the full 6-stage pipeline.
+ * Execute a single tool_use block by delegating to the shared
+ * `executeToolCall` function in `utils/toolExecutor.ts`.
  *
- * Stages:
- *   1. Schema validation (simplified Zod-style check)
- *   2. Semantic validation (`validateInput` if the tool exposes one)
- *   3. Pre-tool hooks (placeholder for future hook system)
- *   4. Permission check
- *   5. `tool.call()` execution
- *   6. Generate `tool_result` block
- *
- * Any unhandled exception at any stage is caught and converted into a
- * standardized error `tool_result` so the model can self-correct.
+ * This thin wrapper adapts the shared executor's `ToolResultBlock` return
+ * value into the `ToolExecutionResult` shape used by the `runTools` batch
+ * runner in this module.
  *
  * @param toolUse       - The tool_use block from the model.
  * @param tool          - The matching ToolInstance.
@@ -340,109 +335,28 @@ async function runToolUse(
   parentMessage: Message,
   canUseTool: CanUseTool,
 ): Promise<ToolExecutionResult> {
-  try {
-    // ----- Stage 1: Schema validation (simplified) -----
-    const schemaError = validateInputSchema(toolUse.input, tool.inputSchema)
-    if (schemaError) {
-      return makeErrorResult(toolUse.id, `Schema validation failed: ${schemaError}`)
-    }
+  const toolResult = await executeToolCall(
+    toolUse,
+    tool,
+    context,
+    parentMessage,
+    canUseTool,
+    // query.ts does not use lifecycle hooks; QueryEngine handles those.
+    [],
+  )
 
-    // ----- Stage 2: Semantic validation -----
-    // Some tools expose a `validateInput` method for richer checks beyond
-    // what the JSON schema can express (e.g. path existence, value ranges).
-    if (typeof (tool as any).validateInput === 'function') {
-      try {
-        const semanticError: string | null = await (tool as any).validateInput(
-          toolUse.input,
-          context,
-        )
-        if (semanticError) {
-          return makeErrorResult(toolUse.id, `Validation failed: ${semanticError}`)
-        }
-      } catch (err) {
-        return makeErrorResult(
-          toolUse.id,
-          `Validation error: ${err instanceof Error ? err.message : String(err)}`,
-        )
-      }
-    }
-
-    // ----- Stage 3: Pre-tool hooks (placeholder) -----
-    // In a full implementation this would invoke user-defined hook scripts
-    // matching the tool name. Hooks can modify input, deny execution, or
-    // inject additional context. Left as a no-op for now.
-
-    // ----- Stage 4: Permission check -----
-    const permission = await canUseTool(tool, toolUse.input)
-
-    if (permission.behavior === 'deny') {
-      return makeErrorResult(
-        toolUse.id,
-        permission.message ?? `Permission denied for tool "${tool.name}".`,
-      )
-    }
-
-    // If the permission system returned modified input, use it from here on.
-    const effectiveInput = permission.updatedInput ?? toolUse.input
-
-    // ----- Stage 5: Execute tool.call() -----
-    const result: ToolResult = await tool.call(
-      effectiveInput,
-      context,
-      canUseTool,
-      parentMessage,
-      /* onProgress */ undefined,
-    )
-
-    // ----- Stage 6: Generate tool_result block -----
-    return {
-      toolUseId: toolUse.id,
-      toolResult: {
-        type: 'tool_result',
-        tool_use_id: toolUse.id,
-        content: result.content ?? (result.output != null ? String(result.output) : ''),
-        is_error: result.isError ?? false,
-      },
-    }
-  } catch (err) {
-    // Catch-all: any unhandled exception becomes a tool error the model can
-    // reason about, rather than crashing the entire loop.
-    const errorMessage = err instanceof Error ? err.message : String(err)
-    return makeErrorResult(
-      toolUse.id,
-      `Tool "${toolUse.name}" failed with an unexpected error: ${errorMessage}`,
-    )
+  return {
+    toolUseId: toolUse.id,
+    toolResult,
   }
 }
 
-/**
- * Perform a simplified schema validation of the tool input.
- *
- * A full implementation would use Zod or JSON Schema; here we perform the
- * most critical check: ensuring that all `required` fields declared in the
- * schema are present in the input.
- *
- * @returns An error message string if validation fails, or `null` if valid.
- */
-function validateInputSchema(
-  input: Record<string, unknown>,
-  schema: Record<string, unknown>,
-): string | null {
-  // Extract `required` array from a typical JSON-Schema-style definition.
-  const required = schema.required
-  if (!Array.isArray(required)) return null
-
-  for (const field of required) {
-    if (typeof field === 'string' && !(field in input)) {
-      return `Missing required field: "${field}"`
-    }
-  }
-
-  return null
-}
+// ============================================================
+// Result Helpers (local to batch runner)
+// ============================================================
 
 /**
- * Build a standardized error tool_result.
+ * Build a standardized error ToolExecutionResult for the batch runner.
  */
 function makeErrorResult(toolUseId: string, message: string): ToolExecutionResult {
   return {

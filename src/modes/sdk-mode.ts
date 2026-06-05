@@ -28,11 +28,14 @@ export async function runSdkMode(options: SdkModeOptions): Promise<void> {
   const runtime = await assembleRuntime({
     model: options.model ?? DEFAULT_MODEL,
     systemPrompt: options.systemPrompt,
+    appendSystemPrompt: options.appendSystemPrompt,
     permissionMode: options.permissionMode ?? 'bypassPermissions',
     maxTokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
     temperature: options.temperature,
     cwd: options.cwd,
     mcpConfigs: [],
+    allowList: options.allowList,
+    denyList: options.denyList,
   })
 
   const engine = createQueryEngine(runtime, { silent: true, isInteractive: false })

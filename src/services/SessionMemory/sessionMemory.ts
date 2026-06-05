@@ -22,6 +22,7 @@ import type {
   SessionMemoryState,
   ToolUseBlock,
 } from '../../types/index.js'
+import { estimateTokenCount } from '../compact/compact.js'
 
 // ---------------------------------------------------------------------------
 // Thresholds
@@ -56,12 +57,12 @@ const SESSION_MEMORY_DIR = '.session-memory'
 // ---------------------------------------------------------------------------
 
 /**
- * Rough token estimator.  Uses the standard ~4-chars-per-token heuristic for
- * English text.  This is intentionally simple — a real implementation would
- * use tiktoken or similar.
+ * Token estimator with CJK awareness.
+ * Delegates to the CJK-aware estimator in the compact service for accurate
+ * estimation across ASCII and CJK text.
  */
 function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4)
+  return estimateTokenCount(text)
 }
 
 /**
