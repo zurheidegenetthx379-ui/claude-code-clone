@@ -30,6 +30,7 @@ import type { BashToolConfig } from './shouldUseSandbox.js'
 import {
   runSandboxChecks,
   shouldEnforceSandbox,
+  extractFilePaths,
 } from '../../utils/sandbox/sandbox-enforcer.js'
 import type { SandboxMode } from '../../utils/sandbox/sandbox-enforcer.js'
 import type { SandboxRuntimeConfig } from '../../utils/sandbox/sandbox-adapter.js'
@@ -172,17 +173,36 @@ const BashTool = buildTool({
       return { behavior: 'deny', message: 'Command matches a deny-list entry.' }
     }
 
-    // Enforce path boundaries — best-effort extraction of file paths from the
-    // command string.  Applied before mode-based shortcuts so protected paths
-    // (.git, .env, etc.) are always blocked regardless of permission mode.
-    const pathLikeTokens = command.match(/(?:^|\s)(\/[\w./-]+|[A-Z]:\\[\w.\\/-]+|\.\.?\/[\w./-]+)/gi) ?? []
-    for (const token of pathLikeTokens) {
-      const pathCheck = checkPathAccessSync(token.trim(), {
-        cwd: (context as unknown as { cwd?: string }).cwd ?? process.cwd(),
-        allowOutsideCwd: context.permissionMode === 'bypassPermissions',
-      })
+    // Enforce path boundaries — extract file paths from the command string
+    // using the sandbox-enforcer's extractor (handles bare relative paths like
+    // `.env`, `.git/config`, etc. that the old regex missed).  Applied before
+    // mode-based shortcuts so protected paths are always blocked regardless
+    // of permission mode.
+    const cwd = (context as unknown as { cwd?: string }).cwd ?? process.cwd()
+    const allowOutsideCwd = context.permissionMode === 'bypassPermissions'
+    const extractedPaths = extractFilePaths(command)
+
+    for (const p of extractedPaths) {
+      const pathCheck = checkPathAccessSync(p, { cwd, allowOutsideCwd })
       if (!pathCheck.allowed) {
         return { behavior: 'deny', message: `Bash command accesses protected path: ${pathCheck.reason}` }
+      }
+    }
+
+    // Also check for known protected filenames/directories anywhere in the
+    // command string — catches cases where extractFilePaths may not detect
+    // a bare relative reference (e.g. `cat .env`, `rm .git/config`).
+    const PROTECTED_FILENAMES = ['.env', '.env.local', '.env.production', '.npmrc', '.netrc', '.gitconfig']
+    const PROTECTED_DIRS = ['.git', '.ssh', '.gnupg', '.aws', '.kube', 'credentials']
+
+    for (const protected_ of [...PROTECTED_FILENAMES, ...PROTECTED_DIRS]) {
+      const escaped = protected_.replace(/\./g, '\\.')
+      const pattern = new RegExp(`(?:^|\\s|[/\\\\])${escaped}(?:\\s|$|[/\\\\])`, 'i')
+      if (pattern.test(command)) {
+        const pathCheck = checkPathAccessSync(protected_, { cwd, allowOutsideCwd })
+        if (!pathCheck.allowed) {
+          return { behavior: 'deny', message: `Bash command references protected path "${protected_}": ${pathCheck.reason}` }
+        }
       }
     }
 

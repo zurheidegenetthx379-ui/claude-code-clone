@@ -7,7 +7,7 @@
  * methods.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { QueryEngine } from '../src/QueryEngine.js'
 import type {
   QueryEngineConfig,
@@ -17,7 +17,6 @@ import type {
   StreamEvent,
   ToolInstance,
   PermissionContext,
-  HookDefinition,
 } from '../src/types/index.js'
 import type { TokenUsage } from '../src/services/api/claude.js'
 

@@ -66,10 +66,23 @@ export async function runHeadless(options: HeadlessOptions): Promise<void> {
     } catch { /* best-effort */ }
 
     const timeoutMs = parseInt(process.env.CC_HEADLESS_TIMEOUT_MS || '300000', 10) // 5 min default
-    const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`Headless query timed out after ${timeoutMs}ms`)), timeoutMs)
-    )
-    const result: QueryResult = await Promise.race([engine.run(options.prompt), timeoutPromise])
+    let timeoutId: ReturnType<typeof setTimeout> | undefined
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(() => {
+        engine.abort() // Abort the running query so the API call doesn't continue
+        reject(new Error(`Headless query timed out after ${timeoutMs}ms`))
+      }, timeoutMs)
+    })
+
+    let result: QueryResult
+    try {
+      result = await Promise.race([engine.run(options.prompt), timeoutPromise])
+    } finally {
+      if (timeoutId !== undefined) {
+        clearTimeout(timeoutId) // Always clean up the timer
+      }
+    }
 
     // Persist assistant response
     try {

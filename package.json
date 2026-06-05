@@ -15,7 +15,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "lint": "eslint src/ tests/",
+    "lint": "eslint src/ tests/ --max-warnings 0",
     "typecheck": "tsc --noEmit",
     "typecheck:strict": "tsc --noEmit --noUnusedLocals --noUnusedParameters",
     "ci": "npm run typecheck && npm run test"

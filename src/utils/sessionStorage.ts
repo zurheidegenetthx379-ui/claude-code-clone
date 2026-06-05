@@ -74,14 +74,14 @@ const DIR_PERMISSIONS = 0o700
 
 /**
  * Maximum interval (ms) between automatic write-queue drains.  The queue
- * also drains when it reaches {@link WRITE_QUEUE_BATCH_SIZE} entries.
+ * also drains when it reaches {@link _WRITE_QUEUE_BATCH_SIZE} entries.
  */
 const WRITE_QUEUE_FLUSH_INTERVAL_MS = 100
 
 /**
  * Maximum number of entries to accumulate before forcing a synchronous drain.
  */
-const WRITE_QUEUE_BATCH_SIZE = 64
+const _WRITE_QUEUE_BATCH_SIZE = 64
 
 // ============================================================
 // Extended Entry Interfaces

@@ -91,7 +91,7 @@ function mockFetchNetworkError() {
   })
 }
 
-function mockFetchTimeout() {
+function _mockFetchTimeout() {
   return vi.fn(async () => {
     const err = new Error('The operation was aborted')
     err.name = 'AbortError'

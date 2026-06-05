@@ -45,7 +45,7 @@ describe('isSandboxingEnabled', () => {
 
   it('returns false when current platform is NOT in enabledPlatforms', () => {
     // Use a platform that definitely isn't the current one
-    const fakePlatform = 'aix' // AIX is unlikely
+    const _fakePlatform = 'aix' // AIX is unlikely
     const currentPlatform = os.platform()
     const otherPlatforms = ['linux', 'darwin', 'win32', 'freebsd'].filter(p => p !== currentPlatform)
     // Pick one that's not the current platform

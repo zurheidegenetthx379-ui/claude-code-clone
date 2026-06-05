@@ -115,7 +115,6 @@ function walkUpwardForSkillsDirs(startDir: string): string[] {
   const dirs: string[] = [];
   let current = path.resolve(startDir);
 
-  // eslint-disable-next-line no-constant-condition
   while (true) {
     const candidate = path.join(current, CC_AGENT_DIR, SKILLS_SUBDIR);
     try {

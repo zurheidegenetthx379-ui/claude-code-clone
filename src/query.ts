@@ -33,7 +33,10 @@ import {
   AUTOCOMPACT_BUFFER_TOKENS,
 } from './utils/context.js'
 
-import { executeToolCall } from './utils/toolExecutor.js'
+import {
+  executeToolCall,
+  buildPermissionChecker,
+} from './utils/toolExecutor.js'
 
 // ============================================================
 // ID Generation
@@ -577,11 +580,15 @@ export async function* query(
     messages,
   }
 
-  // Permission callback — delegates to the tool's own checkPermissions and
-  // then applies the global permission context.
-  const canUseTool: CanUseTool = async (tool, input) => {
-    return tool.checkPermissions(input, permissionContext)
-  }
+  // Permission callback — uses the shared `buildPermissionChecker` from
+  // toolExecutor.ts so that sub-agents running through `query()` get the
+  // same permission semantics as the main QueryEngine:
+  //   1. Deny-list ALWAYS wins (checked first).
+  //   2. Run the tool's own `checkPermissions`.
+  //   3. Tool says "deny" → respect it regardless of allow-list.
+  //   4. Tool says "ask" + allow-list includes tool → upgrade to "allow".
+  //   5. Otherwise use the tool's verdict as-is.
+  const canUseTool: CanUseTool = buildPermissionChecker(permissionContext)
 
   let turn = 0
 

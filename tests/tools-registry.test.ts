@@ -25,7 +25,6 @@ import {
 } from '../src/tools.js'
 import type {
   PermissionContext,
-  ToolInstance,
   McpToolDefinition,
 } from '../src/types/index.js'
 

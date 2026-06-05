@@ -109,6 +109,15 @@ export function checkPathAccessSync(
     if (relPath === protected_ || relPath.startsWith(protected_ + '/') || relPath.startsWith(protected_ + '\\')) {
       return { allowed: false, reason: `Access denied: "${protected_}" is a protected path`, resolvedPath: resolved }
     }
+    // Also check absolute path segments for protected directories
+    const absSegments = resolved.split(/[/\\]/)
+    if (absSegments.includes(protected_)) {
+      // Allow .env.example but not .env
+      if (protected_ === '.env' && absSegments.some(s => s.startsWith('.env.'))) continue
+      if (protected_ !== '.env') {
+        return { allowed: false, reason: `Access denied: path traverses protected directory "${protected_}"`, resolvedPath: resolved }
+      }
+    }
   }
 
   if (options.allowOutsideCwd) {

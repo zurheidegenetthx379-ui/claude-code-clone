@@ -781,8 +781,10 @@ export class QueryEngine {
             continue
           }
         } else {
-          // No callback registered — auto-allow for backward compatibility
-          console.error(`[warn] Tool "${block.name}" requires approval but no callback registered, auto-allowing`)
+          // No callback registered — deny to maintain fail-closed security
+          results.push(this.errorResult(block.id, `Tool "${block.name}" requires user confirmation but no approval callback is configured`))
+          i++
+          continue
         }
       }
 

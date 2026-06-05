@@ -9,7 +9,7 @@
  *  3. `ask` in interactive mode calls approvalCallback (not auto-allow)
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { QueryEngine } from '../src/QueryEngine.js'
 import type { QueryEngineConfig } from '../src/QueryEngine.js'
 import type {
