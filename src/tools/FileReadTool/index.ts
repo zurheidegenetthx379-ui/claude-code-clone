@@ -11,6 +11,7 @@ import { readFile, stat } from 'node:fs/promises'
 import { resolve, isAbsolute } from 'node:path'
 import { extname } from 'node:path'
 import { buildTool } from '../../Tool.js'
+import { checkPathAccessSync } from '../../utils/PathPolicy.js'
 import type {
   ToolResult,
   ToolUseContext,
@@ -138,6 +139,16 @@ const FileReadTool = buildTool({
     if (context.denyList.some((p) => filePath.includes(p))) {
       return { behavior: 'deny', message: 'File path matches deny-list entry.' }
     }
+
+    // Enforce path boundaries (protected paths, cwd containment).
+    const pathCheck = checkPathAccessSync(filePath, {
+      cwd: (context as unknown as { cwd?: string }).cwd ?? process.cwd(),
+      allowOutsideCwd: context.permissionMode === 'bypassPermissions',
+    })
+    if (!pathCheck.allowed) {
+      return { behavior: 'deny', message: pathCheck.reason }
+    }
+
     return { behavior: 'allow' }
   },
 

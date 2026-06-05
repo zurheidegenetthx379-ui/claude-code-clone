@@ -13,7 +13,13 @@
  *   6. Query engine creation via QueryEngine.ts
  *   7. REPL loop or headless execution
  *
- * Exports consumed by entrypoints/cli.ts:
+ * Mode-specific implementations live in src/modes/:
+ *   - modes/headless-mode.ts — single-shot pipe mode
+ *   - modes/sdk-mode.ts      — JSON protocol on stdin/stdout
+ *   - modes/repl-mode.ts     — interactive readline REPL
+ *   - modes/ink-mode.ts      — React+Ink full-screen TUI REPL
+ *
+ * Exports consumed by entrypoints/cli.ts (re-exported from mode files):
  *   - runHeadless(options)  — single-shot pipe mode
  *   - runSdkMode(options)   — JSON protocol on stdin/stdout
  *   - startRepl(options)    — interactive readline REPL
@@ -21,14 +27,12 @@
  *   - main(argv)            — full CLI dispatcher (default export)
  */
 
-import readline from 'node:readline'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 
 import {
   init,
   shutdown,
-  grantTrust,
   emitTelemetry,
 } from './entrypoints/init.js'
 import type { InitContext } from './entrypoints/init.js'
@@ -61,7 +65,6 @@ import type { QueryEngineConfig, QueryResult } from './QueryEngine.js'
 import * as sessionStorage from './utils/sessionStorage.js'
 
 import {
-  initSessionMemory,
   shouldExtractMemory,
   updateSessionMemory,
   getSessionMemoryState,
@@ -113,20 +116,27 @@ import {
 } from './setup.js'
 import type { ProjectSettings } from './setup.js'
 
-import { launchRepl } from './replLauncher.js'
-
 import { loadHooks, runHooks } from './services/hooks/hookRunner.js'
 import type { HookDefinition } from './types/index.js'
 
 import { buildEffectiveSystemPrompt } from './utils/systemPrompt.js'
 
 // ============================================================
+// Re-exports from mode files (backward compatibility for cli.ts)
+// ============================================================
+
+export { runHeadless } from './modes/headless-mode.js'
+export { runSdkMode } from './modes/sdk-mode.js'
+export { startRepl } from './modes/repl-mode.js'
+export { startInkRepl } from './modes/ink-mode.js'
+
+// ============================================================
 // Constants
 // ============================================================
 
-const DEFAULT_MODEL = process.env['CC_AGENT_MODEL'] ?? 'claude-sonnet-4-20250514'
-const DEFAULT_MAX_TOKENS = 8192
-const BANNER = `
+export const DEFAULT_MODEL = process.env['CC_AGENT_MODEL'] ?? 'claude-sonnet-4-20250514'
+export const DEFAULT_MAX_TOKENS = 8192
+export const BANNER = `
   ____   ____   ____   ____   ____   ____
  / ___\\ / ___\\ /  _ \\ /  _ \\ /  __\\ /  __\\
 | |    | |    | |_) || |_) || |___ | |___
@@ -211,7 +221,7 @@ export interface ReplOptions {
 // Assembled runtime context
 // ============================================================
 
-interface AssembledRuntime {
+export interface AssembledRuntime {
   /** The merged tool pool (built-in + MCP). */
   tools: ToolInstance[]
   /** Discovered MCP tool definitions (raw). */
@@ -248,6 +258,20 @@ interface AssembledRuntime {
   backgroundTaskRegistry?: BackgroundTaskRegistry
   /** Lifecycle hooks loaded from project configuration. */
   hooks: HookDefinition[]
+}
+
+// ============================================================
+// HandleCommand result (consumed by repl-mode.ts)
+// ============================================================
+
+/**
+ * Result of dispatching a slash command through the REPL command handler.
+ */
+export interface HandleCommandResult {
+  /** What action the REPL loop should take. */
+  action: 'exit' | 'reset' | 'ok'
+  /** History messages to load into a fresh engine after reset (e.g. /resume). */
+  historyMessages?: Message[]
 }
 
 // ============================================================
@@ -292,11 +316,18 @@ export async function main(argv: string[]): Promise<void> {
 
   const fullSystemPrompt = buildFullSystemPrompt(systemPrompt, appendSystemPrompt)
 
+  // Import mode functions locally to avoid circular import issues at module
+  // evaluation time.  By the time main() is called all modules are fully
+  // initialized, but the dynamic import makes the intent explicit.
+  const { runHeadless: runHeadlessMode } = await import('./modes/headless-mode.js')
+  const { startRepl: startReplMode } = await import('./modes/repl-mode.js')
+  const { startInkRepl: startInkReplMode } = await import('./modes/ink-mode.js')
+
   // ---- Dispatch ----
   try {
     if (isHeadless) {
       const prompt = extractArg(argv, '--print') ?? extractArg(argv, '-p') ?? ''
-      await runHeadless({
+      await runHeadlessMode({
         prompt,
         model,
         systemPrompt: fullSystemPrompt,
@@ -319,520 +350,14 @@ export async function main(argv: string[]): Promise<void> {
         additionalDirs: addDir,
       }
       if (argv.includes('--ink')) {
-        await startInkRepl({ ...replOpts, useInk: true })
+        await startInkReplMode({ ...replOpts, useInk: true })
       } else {
-        await startRepl(replOpts)
+        await startReplMode(replOpts)
       }
     }
   } finally {
     await shutdown(initCtx)
   }
-}
-
-// ============================================================
-// Headless mode (--print)
-// ============================================================
-
-/**
- * Execute a single prompt in headless mode: assemble the runtime, run the
- * query, print the result to stdout, and exit.
- *
- * Designed for piping: the response text is the only thing written to
- * stdout; all diagnostics go to stderr.
- */
-export async function runHeadless(options: HeadlessOptions): Promise<void> {
-  const runtime = await assembleRuntime({
-    model: options.model ?? DEFAULT_MODEL,
-    systemPrompt: options.systemPrompt,
-    permissionMode: options.permissionMode ?? 'default',
-    maxTokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
-    temperature: options.temperature,
-    cwd: options.cwd,
-    mcpConfigs: [],
-  })
-
-  const engine = createQueryEngine(runtime, { silent: true })
-
-  // ---- Run SessionStart hooks ----
-  if (runtime.hooks.length > 0) {
-    try {
-      await runHooks(runtime.hooks, 'SessionStart', {}, runtime.cwd)
-    } catch (err) {
-      console.error(
-        '[hooks] SessionStart hook error:',
-        err instanceof Error ? err.message : String(err),
-      )
-    }
-  }
-
-  try {
-    // Persist user message
-    const userMsgId = randomUUID()
-    try {
-      sessionStorage.appendEntry({
-        type: 'user',
-        uuid: userMsgId,
-        sessionId: runtime.sessionId,
-        timestamp: Date.now(),
-        role: 'user',
-        content: options.prompt,
-      } as any, runtime.cwd)
-    } catch { /* best-effort */ }
-
-    const timeoutMs = parseInt(process.env.CC_HEADLESS_TIMEOUT_MS || '300000', 10) // 5 min default
-    const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`Headless query timed out after ${timeoutMs}ms`)), timeoutMs)
-    )
-    const result: QueryResult = await Promise.race([engine.run(options.prompt), timeoutPromise])
-
-    // Persist assistant response
-    try {
-      sessionStorage.appendEntry({
-        type: 'assistant',
-        uuid: randomUUID(),
-        sessionId: runtime.sessionId,
-        timestamp: Date.now(),
-        role: 'assistant',
-        content: result.text,
-        parentUuid: userMsgId,
-      } as any, runtime.cwd)
-    } catch { /* best-effort */ }
-
-    if (options.outputFormat === 'json') {
-      process.stdout.write(JSON.stringify({
-        text: result.text,
-        stopReason: result.stopReason,
-        turnsUsed: result.turnsUsed,
-        tokenUsage: result.tokenUsage,
-        costUsd: result.costUsd,
-        durationMs: result.durationMs,
-      }))
-    } else {
-      process.stdout.write(result.text)
-      // Ensure trailing newline for shell piping.
-      if (!result.text.endsWith('\n')) {
-        process.stdout.write('\n')
-      }
-    }
-  } catch (err) {
-    console.error(
-      'Error:',
-      err instanceof Error ? err.message : String(err),
-    )
-    process.exitCode = 1
-  } finally {
-    // ---- Run SessionEnd hooks ----
-    if (runtime.hooks.length > 0) {
-      try {
-        await runHooks(runtime.hooks, 'SessionEnd', {}, runtime.cwd)
-      } catch (err) {
-        console.error(
-          '[hooks] SessionEnd hook error:',
-          err instanceof Error ? err.message : String(err),
-        )
-      }
-    }
-    // Flush session write queue before disconnecting
-    try {
-      await sessionStorage.flushWriteQueue()
-    } catch { /* best-effort */ }
-    await runtime.mcpManager.disconnectAll()
-  }
-}
-
-// ============================================================
-// SDK mode (--sdk)
-// ============================================================
-
-/**
- * Run in SDK / machine-to-machine mode.
- *
- * Reads JSON-protocol messages from stdin, processes each through the query
- * engine, and writes JSON responses to stdout.
- *
- * This is a simplified implementation; a production version would implement
- * the full Claude Code SDK wire protocol.
- */
-export async function runSdkMode(options: SdkModeOptions): Promise<void> {
-  const runtime = await assembleRuntime({
-    model: options.model ?? DEFAULT_MODEL,
-    systemPrompt: options.systemPrompt,
-    permissionMode: options.permissionMode ?? 'bypassPermissions',
-    maxTokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
-    temperature: options.temperature,
-    cwd: options.cwd,
-    mcpConfigs: [],
-  })
-
-  const engine = createQueryEngine(runtime, { silent: true })
-
-  // ---- Run SessionStart hooks ----
-  if (runtime.hooks.length > 0) {
-    try {
-      await runHooks(runtime.hooks, 'SessionStart', {}, runtime.cwd)
-    } catch (err) {
-      console.error(
-        '[hooks] SessionStart hook error:',
-        err instanceof Error ? err.message : String(err),
-      )
-    }
-  }
-
-  // Wire up streaming events for the SDK protocol.
-  // Each event is emitted as a JSON line on stdout so the SDK client
-  // gets real-time feedback during query execution.
-  engine.on('text', (chunk: string) => {
-    writeSdkResponse({ type: 'text_delta', content: chunk })
-  })
-  engine.on('tool:use', (toolUse) => {
-    writeSdkResponse({
-      type: 'tool_use',
-      name: toolUse.name,
-      id: toolUse.id,
-      input: toolUse.input,
-    })
-  })
-  engine.on('tool:result', (result) => {
-    writeSdkResponse({
-      type: 'tool_result',
-      toolUseId: result.tool_use_id,
-      content: typeof result.content === 'string' ? result.content : '[complex]',
-      isError: result.is_error ?? false,
-    })
-  })
-
-  // Read JSON lines from stdin.
-  const rl = readline.createInterface({
-    input: process.stdin,
-    crlfDelay: Infinity,
-  })
-
-  try {
-    for await (const line of rl) {
-      if (!line.trim()) continue
-
-      let request: { type: string; prompt?: string }
-      try {
-        request = JSON.parse(line)
-      } catch {
-        writeSdkResponse({ type: 'error', error: 'Invalid JSON on stdin' })
-        continue
-      }
-
-      if (request.type === 'query' && request.prompt) {
-        try {
-          const result = await engine.run(request.prompt)
-          writeSdkResponse({
-            type: 'result',
-            text: result.text,
-            stopReason: result.stopReason,
-            turnsUsed: result.turnsUsed,
-            tokenUsage: result.tokenUsage,
-            costUsd: result.costUsd,
-            durationMs: result.durationMs,
-          })
-        } catch (err) {
-          writeSdkResponse({
-            type: 'error',
-            error: err instanceof Error ? err.message : String(err),
-          })
-        }
-      } else if (request.type === 'abort') {
-        engine.abort()
-        writeSdkResponse({ type: 'aborted' })
-      } else if (request.type === 'shutdown') {
-        break
-      } else {
-        writeSdkResponse({ type: 'error', error: `Unknown request type: ${request.type}` })
-      }
-    }
-  } finally {
-    // Ensure MCP connections are torn down even if stdin processing throws.
-    if (runtime.mcpManager) {
-      await runtime.mcpManager.disconnectAll().catch(() => {})
-    }
-  }
-
-  // ---- Run SessionEnd hooks ----
-  if (runtime.hooks.length > 0) {
-    try {
-      await runHooks(runtime.hooks, 'SessionEnd', {}, runtime.cwd)
-    } catch (err) {
-      console.error(
-        '[hooks] SessionEnd hook error:',
-        err instanceof Error ? err.message : String(err),
-      )
-    }
-  }
-
-  // MCP disconnect is handled by the try/finally block above.
-}
-
-// ============================================================
-// Interactive REPL mode
-// ============================================================
-
-/**
- * Start the interactive read-eval-print loop.
- *
- * Initializes all subsystems, builds the system prompt, prints a startup
- * banner, and enters a readline loop that dispatches user input through the
- * query engine.
- *
- * Supports slash commands:
- *   /help          — print available commands
- *   /clear         — reset the conversation
- *   /compact       — compact the conversation history
- *   /exit          — exit the REPL
- *   /model [name]  — show or switch the active model
- *   /permissions   — show current permission settings
- */
-export async function startRepl(options: ReplOptions): Promise<void> {
-  // ---- Initialization ----
-  const initCtx = await init({
-    cwd: path.resolve(options.cwd),
-    permissionMode: options.permissionMode ?? 'default',
-    headless: false,
-    verbose: options.verbose ?? false,
-  })
-
-  // Grant trust implicitly in REPL mode (user is present and interactive).
-  const trustedCtx = grantTrust(initCtx)
-  emitTelemetry(trustedCtx, 'repl.start', { cwd: trustedCtx.cwd })
-
-  // ---- Assemble runtime ----
-  const runtime = await assembleRuntime({
-    model: options.model ?? DEFAULT_MODEL,
-    systemPrompt: options.systemPrompt,
-    permissionMode: options.permissionMode ?? 'default',
-    maxTokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
-    temperature: options.temperature,
-    cwd: trustedCtx.cwd,
-    mcpConfigs: options.mcpConfigs ?? [],
-    additionalDirs: options.additionalDirs,
-    sessionId: options.resumeSessionId,
-    allowList: options.allowList,
-    denyList: options.denyList,
-  })
-
-  let engine = createQueryEngine(runtime)
-
-  // ---- Session memory initialization ----
-  if (runtime.enableMemory && options.enableMemory !== false) {
-    try {
-      const memPath = await initSessionMemory(runtime.sessionId, runtime.cwd)
-      console.error(`[memory] Session memory file: ${memPath}`)
-    } catch {
-      // Non-fatal — session memory is best-effort.
-    }
-  }
-
-  // ---- Run SessionStart hooks ----
-  if (runtime.hooks.length > 0) {
-    try {
-      await runHooks(
-        runtime.hooks,
-        'SessionStart',
-        { toolName: undefined },
-        runtime.cwd,
-      )
-    } catch (err) {
-      console.error(
-        '[hooks] SessionStart hook error:',
-        err instanceof Error ? err.message : String(err),
-      )
-    }
-  }
-
-  // Track already-surfaced memory files to avoid injecting the same file twice.
-  const alreadySurfacedMemories: string[] = []
-
-  // Track in-flight work so the close handler can wait for completion.
-  let currentQuery: Promise<void> | null = null
-  let lineHandlerBusy: Promise<void> | null = null
-
-  // ---- Startup banner ----
-  console.log(BANNER)
-  console.log(`  Model:       ${runtime.model}`)
-  console.log(`  CWD:         ${runtime.cwd}`)
-  console.log(`  Session:     ${runtime.sessionId}`)
-  console.log(`  Tools:       ${runtime.tools.length} available`)
-  console.log(`  MCP servers: ${runtime.mcpToolDefs.length > 0 ? runtime.mcpToolDefs.length + ' tools' : 'none'}`)
-  console.log(`  Skills:      ${runtime.skills.length} loaded`)
-  console.log(`  Permissions: ${runtime.permissionContext.permissionMode}`)
-  const sandboxStatus = runtime.sandboxRuntimeConfig?.enabled
-    ? `ACTIVE (mode: ${runtime.sandboxMode})`
-    : `disabled (mode: ${runtime.sandboxMode})`
-  console.log(`  Sandbox:     ${sandboxStatus}`)
-  console.log(`  Coordinator: ${runtime.coordinatorMode ? 'ACTIVE' : 'inactive'}`)
-  console.log('')
-
-  // ---- Readline setup ----
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    prompt: '> ',
-    historySize: 200,
-  })
-
-  rl.prompt()
-
-  // Handle initial prompt if provided.
-  if (options.initialPrompt) {
-    console.log(`> ${options.initialPrompt}`)
-    currentQuery = processUserInput(options.initialPrompt, engine, runtime, alreadySurfacedMemories)
-    await currentQuery
-    currentQuery = null
-  }
-
-  // ---- REPL loop ----
-  rl.on('line', async (line: string) => {
-    const trimmed = line.trim()
-    if (!trimmed) {
-      rl.prompt()
-      return
-    }
-
-    const lineWork = (async () => {
-      try {
-        // ---- Slash commands ----
-        if (trimmed.startsWith('/')) {
-          const handled = await handleCommand(
-            trimmed,
-            engine,
-            runtime,
-          )
-          if (handled === 'exit') {
-            rl.close()
-            return
-          }
-          if (handled === 'reset') {
-            // After /clear, recreate the engine with fresh state.
-            engine = createQueryEngine(runtime)
-          }
-        } else {
-          // ---- Normal prompt ----
-          currentQuery = processUserInput(trimmed, engine, runtime, alreadySurfacedMemories)
-          await currentQuery
-          currentQuery = null
-        }
-      } catch (err) {
-        currentQuery = null
-        console.error(
-          'Error:',
-          err instanceof Error ? err.message : String(err),
-        )
-      }
-
-      rl.prompt()
-    })()
-
-    lineHandlerBusy = lineWork
-    await lineWork
-    lineHandlerBusy = null
-  })
-
-  rl.on('close', async () => {
-    // Wait for any in-flight work to complete before shutting down.
-    if (lineHandlerBusy) {
-      try { await lineHandlerBusy } catch { /* ignore */ }
-    }
-    if (currentQuery) {
-      try { await currentQuery } catch { /* ignore */ }
-    }
-    console.log('\nGoodbye!')
-    await gracefulShutdown(runtime, trustedCtx)
-    process.exit(0)
-  })
-
-  // Handle SIGINT gracefully.
-  process.on('SIGINT', () => {
-    if (engine.getState().status === 'running') {
-      console.log('\nAborting current query...')
-      engine.abort()
-    } else {
-      rl.close()
-    }
-  })
-}
-
-// ============================================================
-// Interactive REPL mode — Ink TUI (--ink)
-// ============================================================
-
-/**
- * Start the interactive REPL using the React+Ink terminal UI.
- *
- * Performs the same initialization and runtime assembly as `startRepl()`,
- * but renders the full-screen Ink component tree from
- * `components/REPL/REPL.tsx` instead of using a plain readline loop.
- */
-export async function startInkRepl(options: ReplOptions): Promise<void> {
-  // ---- Initialization (same as startRepl) ----
-  const initCtx = await init({
-    cwd: path.resolve(options.cwd),
-    permissionMode: options.permissionMode ?? 'default',
-    headless: false,
-    verbose: options.verbose ?? false,
-  })
-
-  const trustedCtx = grantTrust(initCtx)
-  emitTelemetry(trustedCtx, 'repl.ink.start', { cwd: trustedCtx.cwd })
-
-  // ---- Assemble runtime (same as startRepl) ----
-  const runtime = await assembleRuntime({
-    model: options.model ?? DEFAULT_MODEL,
-    systemPrompt: options.systemPrompt,
-    permissionMode: options.permissionMode ?? 'default',
-    maxTokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
-    temperature: options.temperature,
-    cwd: trustedCtx.cwd,
-    mcpConfigs: options.mcpConfigs ?? [],
-    additionalDirs: options.additionalDirs,
-    sessionId: options.resumeSessionId,
-    allowList: options.allowList,
-    denyList: options.denyList,
-  })
-
-  // Create the query engine in fully-silent mode — the Ink component handles
-  // its own display via engine events, so we suppress ALL console output
-  // to avoid corrupting the Ink render.
-  const engine = createQueryEngine(runtime, { fullySilent: true })
-
-  // ---- Session memory initialization (Ink mode) ----
-  if (runtime.enableMemory) {
-    try {
-      await initSessionMemory(runtime.sessionId, runtime.cwd)
-    } catch { /* best-effort */ }
-  }
-
-  // ---- Run SessionStart hooks ----
-  if (runtime.hooks.length > 0) {
-    try {
-      await runHooks(runtime.hooks, 'SessionStart', {}, runtime.cwd)
-    } catch (err) {
-      console.error(
-        '[hooks] SessionStart hook error:',
-        err instanceof Error ? err.message : String(err),
-      )
-    }
-  }
-
-  // ---- Launch the Ink REPL via replLauncher.ts ----
-  // The launcher handles terminal setup (alt screen, raw mode), store
-  // creation, Ink rendering, and terminal cleanup on exit.
-  await launchRepl({
-    queryEngine: engine,
-    tools: runtime.tools,
-    systemPrompt: runtime.systemPrompt,
-    cwd: runtime.cwd,
-    sessionId: runtime.sessionId,
-    permissionContext: runtime.permissionContext,
-    initialPrompt: options.initialPrompt,
-  })
-
-  // ---- Cleanup ----
-  await gracefulShutdown(runtime, trustedCtx)
 }
 
 // ============================================================
@@ -846,7 +371,7 @@ export async function startInkRepl(options: ReplOptions): Promise<void> {
  * This is the single function that wires together every subsystem into a
  * coherent context object consumed by the query engine and REPL.
  */
-async function assembleRuntime(options: {
+export async function assembleRuntime(options: {
   model: string
   systemPrompt?: string
   permissionMode: PermissionMode
@@ -870,9 +395,6 @@ async function assembleRuntime(options: {
   } catch { /* best-effort */ }
 
   // ---- Project settings (from setup.ts) ----
-  // Load project-level configuration from <cwd>/.cc-agent/settings.json.
-  // Settings provide project-scoped overrides for model, system prompt,
-  // permission mode, and MCP server connections.
   const projectSettings: ProjectSettings = await loadProjectConfig(cwd)
 
   // Apply model override from project settings (CLI args take precedence).
@@ -927,8 +449,6 @@ async function assembleRuntime(options: {
   })
 
   // ---- System prompt ----
-  // Use the priority-based system prompt assembler to unify override,
-  // coordinator, agent, custom, and default prompts in a single call.
   const coordinatorMode = isCoordinatorMode()
   const effectiveSystemPrompt = await buildEffectiveSystemPrompt({
     tools: filteredTools,
@@ -946,10 +466,6 @@ async function assembleRuntime(options: {
   }
 
   // ---- Context injection (from context.ts) ----
-  // Gather per-session contextual information (project memory files, git
-  // status, platform info) and inject as an <environment> block into the
-  // system prompt.  This happens BEFORE memory directory injection so the
-  // ordering is: base prompt -> context -> memory -> coordinator override.
   try {
     const userCtx = await getUserContext(cwd)
     const sysCtx = await getSystemContext(cwd)
@@ -962,9 +478,6 @@ async function assembleRuntime(options: {
   }
 
   // ---- Memory directory injection ----
-  // Look for a memory directory at .cc-agent/memory/ and inject its
-  // contents (MEMORY.md entrypoint + sibling file manifest) into the
-  // system prompt so the model has persistent project-scoped context.
   const memoryDir = path.join(cwd, '.cc-agent', 'memory')
   const enableMemory = true // default on; CLI flag can disable later
   try {
@@ -977,9 +490,6 @@ async function assembleRuntime(options: {
   }
 
   // ---- Sandbox configuration ----
-  // Read sandbox settings from .cc-agent/sandbox.json (or use defaults).
-  // The adapter translates these high-level settings into a low-level
-  // SandboxRuntimeConfig that the sandbox-enforcer consumes.
   const defaultSandboxSettings: SandboxSettings = {
     enabled: false,
     enabledPlatforms: [],
@@ -1014,21 +524,12 @@ async function assembleRuntime(options: {
     adapterPermCtx,
   )
 
-  // ---- Coordinator mode ----
-  // Coordinator mode is already factored into the system prompt via
-  // buildEffectiveSystemPrompt above.  The swarm infrastructure below
-  // is instantiated conditionally based on the coordinatorMode flag.
-
   // ---- Swarm infrastructure ----
-  // Only instantiate the swarm primitives when coordinator mode is active.
-  // They are lightweight but unnecessary for single-agent sessions.
   const teamRegistry = coordinatorMode ? new TeamRegistry() : undefined
   const fileMailbox = coordinatorMode ? new FileMailbox(cwd) : undefined
   const backgroundTaskRegistry = coordinatorMode ? new BackgroundTaskRegistry() : undefined
 
   // ---- Hooks ----
-  // Load lifecycle hooks from project configuration (.cc-agent/hooks.json
-  // or .cc-agent/settings.json).  Hook failures are logged but never fatal.
   let hooks: HookDefinition[] = []
   try {
     hooks = await loadHooks(cwd)
@@ -1041,10 +542,6 @@ async function assembleRuntime(options: {
       err instanceof Error ? err.message : String(err),
     )
   }
-
-  // Persist the swarm infrastructure into appState so tools can access it.
-  // The QueryEngine reads these from the config's appState and injects them
-  // into the ToolUseContext on each tool call.
 
   return {
     tools: filteredTools,
@@ -1079,10 +576,13 @@ async function assembleRuntime(options: {
  * @param options  — optional flags:
  *   - `silent`: when true, skip the real-time text streaming listener.
  *     Used by headless mode which outputs text via `result.text` instead.
+ *   - `fullySilent`: when true, skip ALL console output (Ink TUI mode).
+ *   - `isInteractive`: when true, tools returning `{ behavior: 'ask' }` are
+ *     allowed; non-interactive modes auto-deny them.
  */
-function createQueryEngine(
+export function createQueryEngine(
   runtime: AssembledRuntime,
-  options: { silent?: boolean; fullySilent?: boolean } = {},
+  options: { silent?: boolean; fullySilent?: boolean; isInteractive?: boolean } = {},
 ): QueryEngine {
   const config: QueryEngineConfig = {
     model: runtime.model,
@@ -1092,6 +592,10 @@ function createQueryEngine(
     cwd: runtime.cwd,
     sessionId: runtime.sessionId,
     maxTokens: DEFAULT_MAX_TOKENS,
+    // Interactive mode: only set when explicitly requested (REPL modes).
+    // Headless and SDK modes default to non-interactive, which causes
+    // tools returning `{ behavior: 'ask' }` to be denied automatically.
+    isInteractive: options.isInteractive ?? false,
     // Inject sandbox and swarm infrastructure into appState so tools
     // (AgentTool in particular) can access the registries at invocation time.
     sandboxState: {
@@ -1150,7 +654,7 @@ function createQueryEngine(
 }
 
 // ============================================================
-// User input processing
+// User input processing (shared with repl-mode.ts)
 // ============================================================
 
 /**
@@ -1160,7 +664,7 @@ function createQueryEngine(
  *  - Relevant memory injection (before the query)
  *  - Session memory extraction (after the query, threshold-gated)
  */
-async function processUserInput(
+export async function processUserInput(
   prompt: string,
   engine: QueryEngine,
   runtime: AssembledRuntime,
@@ -1169,8 +673,6 @@ async function processUserInput(
   console.log('') // Blank line before response.
 
   // ---- Relevant memory injection ----
-  // Before the query, find relevant memory files and inject a hint into
-  // the prompt so the model knows about available context.
   let effectivePrompt = prompt
   if (runtime.enableMemory && alreadySurfacedMemories) {
     try {
@@ -1255,8 +757,6 @@ async function processUserInput(
     if (shouldAutoCompact(totalTokens, effectiveWindow)) {
       console.error('[auto-compact] Context approaching limit, compacting...')
 
-      // Use the real compact service: strip images, preserve tool chains,
-      // compute a summary, and reload the engine with compacted history.
       const targetTokens = Math.floor(effectiveWindow * 0.5) // keep 50% budget
       const { result, keptMessages } = compactConversation(
         state.messages,
@@ -1281,23 +781,24 @@ async function processUserInput(
 }
 
 // ============================================================
-// Slash command dispatch (delegates to commands.ts registry)
+// Slash command dispatch (shared with repl-mode.ts)
 // ============================================================
 
 /**
  * Dispatch a slash command through the command registry from commands.ts
- * and return a status string for the REPL loop.
+ * and return a structured result for the REPL loop.
  *
- * Returns:
- *   - 'exit'    — the REPL should terminate
- *   - 'reset'   — the engine was reset (e.g. /clear, /compact, /resume)
- *   - 'ok'      — command handled, continue normally
+ * Returns a {@link HandleCommandResult} with:
+ *   - action: 'exit'  — the REPL should terminate
+ *   - action: 'reset' — the engine was reset (e.g. /clear, /compact, /resume)
+ *   - action: 'ok'    — command handled, continue normally
+ *   - historyMessages — optional messages to load into a fresh engine
  */
-async function handleCommand(
+export async function handleCommand(
   input: string,
   engine: QueryEngine,
   runtime: AssembledRuntime,
-): Promise<'exit' | 'reset' | 'ok'> {
+): Promise<HandleCommandResult> {
   // Build the CommandContext expected by the command registry.
   const commandContext: CommandContext = {
     queryEngine: engine,
@@ -1330,13 +831,13 @@ async function handleCommand(
   // Handle error results — display and continue.
   if (result.error) {
     console.error(result.error)
-    return 'ok'
+    return { action: 'ok' }
   }
 
   // Handle exit signal.
   if (result.exit) {
     if (result.text) console.log(result.text)
-    return 'exit'
+    return { action: 'exit' }
   }
 
   // Print the command's text output (if any).
@@ -1347,12 +848,10 @@ async function handleCommand(
   // Handle clearMessages signal (/clear).
   if (result.clearMessages) {
     engine.reset()
-    return 'reset'
+    return { action: 'reset' }
   }
 
   // Special post-processing for /compact:
-  // The command registry signals intent but the REPL performs the actual
-  // compaction since it owns the engine lifecycle.
   const commandName = input.trim().replace(/^\/+/, '').split(/\s+/)[0]!.toLowerCase()
 
   if (commandName === 'compact') {
@@ -1371,18 +870,17 @@ async function handleCommand(
         `kept ${compactResult.messagesKept}. ` +
         `Tokens: ${compactResult.tokenCountBefore} → ${compactResult.tokenCountAfter}`,
       )
-      return 'reset'
+      return { action: 'reset' }
     }
-    return 'ok'
+    return { action: 'ok' }
   }
 
   // Special post-processing for /resume:
-  // The command registry returns a signal; the REPL performs the actual
-  // session recovery since it owns the engine lifecycle.
   if (commandName === 'resume') {
     const resumeArgs = input.trim().replace(/^\/+/, '').split(/\s+/).slice(1).join(' ').trim()
     const targetId = resumeArgs || 'last'
     console.log(`Resuming session: ${targetId}...`)
+    let historyMessages: Message[] = []
     try {
       const { loadConversationForResume } = await import('./utils/conversationRecovery.js')
       const recovery = await loadConversationForResume(targetId, runtime.cwd)
@@ -1413,10 +911,9 @@ async function handleCommand(
         console.log(`  Files touched: ${recovery.fileHistory.slice(0, 5).join(', ')}`)
       }
 
-      // Create a fresh engine and inject the recovered history.
-      engine = createQueryEngine(runtime)
+      // Build history messages for the REPL loop to load into a fresh engine.
       if (messages.length > 0) {
-        const historyMessages: Message[] = messages.map(m => ({
+        historyMessages = messages.map((m: any) => ({
           id: m.id || m.uuid,
           uuid: m.uuid,
           role: m.role,
@@ -1425,14 +922,13 @@ async function handleCommand(
           parentUuid: m.parentUuid,
           model: m.model,
         }))
-        engine.loadHistory(historyMessages)
 
         // If there was an interrupted turn, show the continuation context
         if (recovery.interruptedTurnState) {
           const pending = recovery.interruptedTurnState.pendingToolUses
           console.log(
             `  Detected interrupted turn with ${pending.length} pending tool call(s): ` +
-            pending.map(t => t.name).join(', '),
+            pending.map((t: any) => t.name).join(', '),
           )
         }
 
@@ -1442,26 +938,21 @@ async function handleCommand(
     } catch (err) {
       console.error('Resume failed:', err instanceof Error ? err.message : String(err))
     }
-    return 'reset'
+    return { action: 'reset', historyMessages }
   }
 
   // Special post-processing for /model:
-  // After a successful model switch, signal the REPL to recreate the engine.
-  // The REPL loop handles engine recreation via the 'reset' signal.
   if (commandName === 'model' && result.text?.startsWith('Model switched to:')) {
-    return 'reset'
+    return { action: 'reset' }
   }
 
-  return 'ok'
+  return { action: 'ok' }
 }
 
 // ============================================================
 // System prompt construction
 // ============================================================
 
-/**
- * Build the default system prompt when none is provided via CLI.
- *
 /**
  * Compose the full system prompt from the base and optional appendage.
  */
@@ -1488,7 +979,7 @@ function buildFullSystemPrompt(
  * during shutdown are logged but do not propagate -- the goal is to
  * release as many resources as possible.
  */
-async function gracefulShutdown(
+export async function gracefulShutdown(
   runtime: AssembledRuntime,
   initCtx: InitContext,
 ): Promise<void> {
@@ -1580,15 +1071,9 @@ async function gracefulShutdown(
 }
 
 // ============================================================
-// Tool-pool merging
+// Tool-pool merging (private)
 // ============================================================
 
-/**
- * Merge built-in tools with MCP tool instances.
- *
- * Built-in tools always take priority when names collide.  Among MCP tools
- * the first-seen wins.
- */
 function mergeToolPools(
   builtIn: ToolInstance[],
   mcpTools: ToolInstance[],
@@ -1608,26 +1093,15 @@ function mergeToolPools(
 }
 
 // ============================================================
-// Argv helpers
+// Argv helpers (private)
 // ============================================================
 
-/**
- * Extract the value of a `--flag value` pair from an argv array.
- * Returns `undefined` when the flag is absent.
- */
 function extractArg(argv: string[], flag: string): string | undefined {
   const idx = argv.indexOf(flag)
   if (idx === -1 || idx + 1 >= argv.length) return undefined
   return argv[idx + 1]
 }
 
-/**
- * Extract all values for a repeatable `--flag value` argument.
- *
- * @example
- * extractAllArgs(['--add-dir', 'a', '--add-dir', 'b'], '--add-dir')
- * // => ['a', 'b']
- */
 function extractAllArgs(argv: string[], flag: string): string[] {
   const values: string[] = []
   for (let i = 0; i < argv.length; i++) {
@@ -1640,12 +1114,72 @@ function extractAllArgs(argv: string[], flag: string): string[] {
 }
 
 // ============================================================
-// SDK-mode helpers
+// SDK-mode helpers (shared with sdk-mode.ts)
 // ============================================================
 
-function writeSdkResponse(data: Record<string, unknown>): void {
+export function writeSdkResponse(data: Record<string, unknown>): void {
   process.stdout.write(JSON.stringify(data) + '\n')
 }
+
+// ============================================================
+// SIGTERM handler (Task 4)
+// ============================================================
+
+/**
+ * Shared cleanup state for signal handlers.
+ * Set by mode functions when they create a runtime/engine pair.
+ */
+let _signalRuntime: AssembledRuntime | null = null
+let _signalEngine: QueryEngine | null = null
+let _signalInitCtx: InitContext | null = null
+
+/**
+ * Register the current runtime/engine pair for signal-based cleanup.
+ * Mode functions call this after creating the runtime so that SIGTERM
+ * can perform an orderly shutdown.
+ */
+export function registerSignalHandlers(
+  runtime: AssembledRuntime,
+  engine: QueryEngine | null,
+  initCtx: InitContext | null,
+): void {
+  _signalRuntime = runtime
+  _signalEngine = engine
+  _signalInitCtx = initCtx
+}
+
+/**
+ * Shared SIGTERM/SIGINT cleanup logic.
+ */
+async function signalShutdown(): Promise<void> {
+  console.error('\nReceived termination signal, shutting down...')
+
+  // Cancel any running queries
+  if (_signalEngine?.getState().status === 'running') {
+    _signalEngine.abort()
+  }
+
+  // Disconnect MCP servers
+  if (_signalRuntime?.mcpManager) {
+    await _signalRuntime.mcpManager.disconnectAll().catch(() => {})
+  }
+
+  // Cancel background tasks
+  if (_signalRuntime?.backgroundTaskRegistry) {
+    try { _signalRuntime.backgroundTaskRegistry.cancelAll() } catch { /* best-effort */ }
+  }
+
+  // Perform full graceful shutdown if init context is available
+  if (_signalRuntime && _signalInitCtx) {
+    await gracefulShutdown(_signalRuntime, _signalInitCtx).catch(() => {})
+  }
+
+  process.exit(130)
+}
+
+process.on('SIGTERM', () => {
+  signalShutdown().catch(() => process.exit(130))
+})
 
 // ============================================================
 // Default export

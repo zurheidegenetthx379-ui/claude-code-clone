@@ -1,11 +1,15 @@
 /**
- * BashTool - Execute shell commands with timeout, sandbox, and abort support.
+ * BashTool - Execute shell commands with timeout, command guard, and abort support.
  *
  * Security notes:
- *   - Sandbox is enabled by default (fail-closed).
+ *   - Command Guard (pre-flight check) is enabled by default (fail-closed).
  *   - Commands are executed via child_process.spawn with shell: true to
  *     support pipes, redirects, etc.  Callers must sanitise input.
  *   - A configurable timeout (default 120 s) prevents runaway processes.
+ *
+ * NOTE: The command guard provides heuristic pre-flight checks, NOT
+ * OS-level sandboxing.  For true isolation, use containers or OS-level
+ * sandboxing (e.g., Docker, Firejail, Seatbelt).
  */
 
 import { spawn } from 'node:child_process'

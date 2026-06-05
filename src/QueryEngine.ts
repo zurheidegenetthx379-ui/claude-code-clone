@@ -131,6 +131,17 @@ export interface QueryEngineConfig {
    * each tool invocation.
    */
   hooks?: HookDefinition[]
+  /**
+   * Whether the engine is running in an interactive mode (TTY / REPL).
+   * When `false` (default), tools that return `{ behavior: 'ask' }` are
+   * treated as denied because there is no user present to confirm.
+   * When `true`, `ask` results are auto-allowed for now.
+   *
+   * TODO: In interactive mode, `ask` should emit a `tool:approval_needed`
+   * event and pause execution until the REPL layer collects user confirmation.
+   * This wiring is a separate concern and not yet implemented.
+   */
+  isInteractive?: boolean
 }
 
 export interface QueryEngineState {
@@ -716,82 +727,88 @@ export class QueryEngine {
   /**
    * Execute a batch of tool calls.
    *
-   * Concurrency-safe tools are run in parallel via `Promise.allSettled`;
-   * all others are executed sequentially to avoid side-effect ordering
-   * issues.
+   * Processes the batch in order, grouping CONSECUTIVE concurrency-safe tools
+   * into parallel batches while preserving the original order relative to
+   * non-safe tools.  This avoids reordering side effects: e.g.
+   * [read, write, read] stays in that order rather than becoming
+   * [read, read] concurrent then [write] sequential.
    */
   private async executeToolBatch(
     toolUseBlocks: ToolUseBlock[],
     parentMessage: Message,
   ): Promise<ToolResultBlock[]> {
-    // Permission pre-checks
     const permissions = await this.checkToolPermissions(toolUseBlocks)
-
-    // Partition into concurrent vs sequential
-    const concurrent: Array<{
-      block: ToolUseBlock
-      tool: ToolInstance
-    }> = []
-    const sequential: Array<{
-      block: ToolUseBlock
-      tool: ToolInstance
-    }> = []
-
-    for (const block of toolUseBlocks) {
-      if (permissions.get(block.id)?.behavior === 'deny') continue
-
-      const tool = this.findTool(block.name)
-      if (!tool) continue
-
-      if (
-        toolUseBlocks.length > 1 &&
-        tool.isConcurrencySafe(block.input)
-      ) {
-        concurrent.push({ block, tool })
-      } else {
-        sequential.push({ block, tool })
-      }
-    }
-
-    // Execute
     const results: ToolResultBlock[] = []
 
-    if (concurrent.length > 0) {
-      const settled = await Promise.allSettled(
-        concurrent.map(({ block, tool }) =>
-          this.executeSingleTool(block, tool, parentMessage),
-        ),
-      )
-      for (const [i, outcome] of settled.entries()) {
-        results.push(this.settleToResult(outcome, concurrent[i]!.block))
-      }
-    }
+    // Group consecutive concurrency-safe tools into parallel batches,
+    // while preserving the original order relative to non-safe tools.
+    let i = 0
+    while (i < toolUseBlocks.length) {
+      const block = toolUseBlocks[i]!
+      const perm = permissions.get(block.id)
 
-    for (const { block, tool } of sequential) {
+      // Handle denied tools (add deny result).
+      if (perm?.behavior === 'deny') {
+        results.push(this.errorResult(block.id, perm.message ?? `Permission denied for "${block.name}"`))
+        i++
+        continue
+      }
+
+      // In non-interactive mode, 'ask' cannot be resolved — treat as deny.
+      if (perm?.behavior === 'ask' && !this.config.isInteractive) {
+        results.push(this.errorResult(
+          block.id,
+          `Tool requires user confirmation but running in non-interactive mode`,
+        ))
+        i++
+        continue
+      }
+
+      const tool = this.findTool(block.name)
+      if (!tool) {
+        results.push(this.errorResult(block.id, `Unknown tool: "${block.name}"`))
+        i++
+        continue
+      }
+
+      // Collect consecutive concurrency-safe tools.
+      if (tool.isConcurrencySafe(block.input) && toolUseBlocks.length > 1) {
+        const batch: Array<{ block: ToolUseBlock; tool: ToolInstance }> = [{ block, tool }]
+        let j = i + 1
+        while (j < toolUseBlocks.length) {
+          const nextBlock = toolUseBlocks[j]!
+          const nextPerm = permissions.get(nextBlock.id)
+          // Stop at denied tools — they need inline error results.
+          if (nextPerm?.behavior === 'deny') break
+          // Stop at ask-in-non-interactive — same treatment as deny.
+          if (nextPerm?.behavior === 'ask' && !this.config.isInteractive) break
+          const nextTool = this.findTool(nextBlock.name)
+          if (!nextTool || !nextTool.isConcurrencySafe(nextBlock.input)) break
+          batch.push({ block: nextBlock, tool: nextTool })
+          j++
+        }
+
+        // Execute the consecutive safe batch in parallel.
+        if (batch.length > 1) {
+          const settled = await Promise.allSettled(
+            batch.map(({ block: b, tool: t }) => this.executeSingleTool(b, t, parentMessage))
+          )
+          for (const [k, outcome] of settled.entries()) {
+            results.push(this.settleToResult(outcome, batch[k]!.block))
+          }
+          i = j
+          continue
+        }
+      }
+
+      // Single tool execution (non-safe or alone).
       try {
         const result = await this.executeSingleTool(block, tool, parentMessage)
         results.push(result)
       } catch (err) {
-        results.push(
-          this.errorResult(
-            block.id,
-            err instanceof Error ? err.message : String(err),
-          ),
-        )
+        results.push(this.errorResult(block.id, err instanceof Error ? err.message : String(err)))
       }
-    }
-
-    // Add denied results
-    for (const block of toolUseBlocks) {
-      const perm = permissions.get(block.id)
-      if (perm?.behavior === 'deny') {
-        results.push(
-          this.errorResult(
-            block.id,
-            perm.message ?? `Permission denied for tool "${block.name}"`,
-          ),
-        )
-      }
+      i++
     }
 
     return results

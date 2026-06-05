@@ -1,9 +1,14 @@
 /**
- * Sandbox configuration adapter.
+ * Command Guard configuration adapter.
  *
  * Translates high-level application settings and permission contexts into
- * low-level sandbox runtime configurations that govern filesystem access,
- * network rules, and platform-specific sandboxing behaviour.
+ * low-level runtime configurations that govern filesystem access,
+ * network rules, and platform-specific command guard behaviour.
+ *
+ * NOTE: This module provides heuristic pre-flight checks, NOT OS-level
+ * sandboxing.  Shell commands can bypass pattern-based detection via
+ * variables, scripts, or interpreters.  For true isolation, use containers
+ * or OS-level sandboxing (e.g., Docker, Firejail, Seatbelt).
  */
 
 import path from 'node:path';

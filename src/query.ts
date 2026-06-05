@@ -634,7 +634,7 @@ export async function* query(
   } = options
 
   // Working copy of messages — we append to this across turns.
-  let messages: Message[] = [...options.messages]
+  const messages: Message[] = [...options.messages]
 
   // Build the tool definitions for the API (serializable schema objects).
   const apiTools = tools

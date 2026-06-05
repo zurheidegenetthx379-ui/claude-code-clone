@@ -49,8 +49,41 @@ export interface PostCompactAttachment {
 // Token estimation
 // ---------------------------------------------------------------------------
 
+/**
+ * Estimate token count with CJK-awareness.
+ *
+ * - ASCII text: ~4 chars per token (GPT/Claude tokenizer average)
+ * - CJK characters: ~1.5 chars per token (each character is ~1-2 tokens)
+ * - Mixed content: weighted combination
+ */
+export function estimateTokenCount(text: string): number {
+  let asciiChars = 0
+  let cjkChars = 0
+
+  for (const char of text) {
+    const code = char.codePointAt(0) ?? 0
+    // CJK Unified Ideographs, Hiragana, Katakana, Hangul, etc.
+    if (
+      (code >= 0x4E00 && code <= 0x9FFF) ||   // CJK Unified
+      (code >= 0x3040 && code <= 0x309F) ||   // Hiragana
+      (code >= 0x30A0 && code <= 0x30FF) ||   // Katakana
+      (code >= 0xAC00 && code <= 0xD7AF) ||   // Hangul
+      (code >= 0x3400 && code <= 0x4DBF) ||   // CJK Extension A
+      (code >= 0x20000 && code <= 0x2A6DF) || // CJK Extension B
+      (code >= 0xF900 && code <= 0xFAFF)      // CJK Compat
+    ) {
+      cjkChars++
+    } else {
+      asciiChars++
+    }
+  }
+
+  return Math.ceil(asciiChars / 4 + cjkChars / 1.5)
+}
+
+/** @deprecated Use {@link estimateTokenCount} instead. */
 function defaultEstimateTokens(text: string): number {
-  return Math.ceil(text.length / 4)
+  return estimateTokenCount(text)
 }
 
 function messageTokenCount(

@@ -11,6 +11,3 @@ export default tseslint.config(
     },
   },
 )
-
-// NOTE: `typescript-eslint` is NOT currently listed in devDependencies.
-// Install it with: npm install -D typescript-eslint

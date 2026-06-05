@@ -1,8 +1,13 @@
 /**
- * Sandbox runtime enforcement.
+ * Command Guard — pre-flight command validation and risk classification.
  *
  * Validates filesystem access, network rules, and environment sanitization
- * before a command is spawned inside the sandbox.
+ * before a command is spawned, providing heuristic pre-flight checks.
+ *
+ * NOTE: This module provides heuristic pre-flight checks, NOT OS-level
+ * sandboxing.  Shell commands can bypass pattern-based detection via
+ * variables, scripts, or interpreters.  For true isolation, use containers
+ * or OS-level sandboxing (e.g., Docker, Firejail, Seatbelt).
  */
 
 import path from 'node:path'

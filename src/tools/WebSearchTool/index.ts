@@ -179,8 +179,10 @@ function parseSearchResults(html: string, maxResults: number): SearchResult[] {
 
   // Match each result block
   // DuckDuckGo wraps results in elements with class "result" and "result__body"
+  // Each block contains one inner <div class="result__snippet">, so we match
+  // past the first </div> (inner) to the second </div> (outer block boundary).
   const resultBlockRegex =
-    /<div[^>]*class="[^"]*result__body[^"]*"[^>]*>([\s\S]*?)<\/div>\s*(?=<div[^>]*class="[^"]*result__body|$)/gi
+    /<div[^>]*class="[^"]*result__body[^"]*"[^>]*>([\s\S]*?<\/div>\s*<\/div>)/gi
 
   let blockMatch: RegExpExecArray | null
   while ((blockMatch = resultBlockRegex.exec(html)) !== null && results.length < maxResults) {

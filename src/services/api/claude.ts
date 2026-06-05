@@ -25,6 +25,7 @@ import type {
   ToolInstance,
   ToolUseBlock,
 } from '../../types/index.js'
+import { estimateTokenCount } from '../compact/compact.js'
 
 // ============================================================
 // Configuration Types
@@ -41,6 +42,17 @@ export interface ClaudeApiClientConfig {
   defaultModel?: string
   /** Additional HTTP headers sent with every request. */
   headers?: Record<string, string>
+  /**
+   * Enable Anthropic prompt caching (cache_control API).
+   *
+   * When enabled, the system prompt and the last 2 user messages are marked
+   * with `cache_control: { type: 'ephemeral' }` so the API can cache them
+   * across turns, reducing token costs by 30-50%.
+   *
+   * Only works with Anthropic's official API (not all third-party proxies).
+   * Defaults to `false`.
+   */
+  enablePromptCache?: boolean
 }
 
 export interface StreamOptions {
@@ -213,6 +225,48 @@ function extractRetryAfter(error: unknown): number | undefined {
 }
 
 // ============================================================
+// Prompt cache helpers
+// ============================================================
+
+/**
+ * Add `cache_control: { type: 'ephemeral' }` to the last content block of
+ * the last `count` user messages in the formatted message array.
+ *
+ * Anthropic's caching API supports up to 4 cache breakpoints per request.
+ * Marking the last 2 user messages ensures the most recent conversation
+ * context (including tool results) is cached, which typically covers the
+ * most expensive-to-reprocess content.
+ *
+ * Modifies the messages array in-place.
+ */
+function addCacheControlToRecentMessages(
+  messages: MessageParam[],
+  count: number,
+): void {
+  // Walk backwards through messages to find the last `count` user messages.
+  let marked = 0
+  for (let i = messages.length - 1; i >= 0 && marked < count; i--) {
+    const msg = messages[i]!
+    if (msg.role !== 'user') continue
+
+    if (typeof msg.content === 'string') {
+      // Convert string content to a block array so we can attach cache_control.
+      msg.content = [{
+        type: 'text' as const,
+        text: msg.content,
+        cache_control: { type: 'ephemeral' as const },
+      }]
+    } else if (Array.isArray(msg.content) && msg.content.length > 0) {
+      // Attach cache_control to the LAST content block of this message.
+      const lastBlock = msg.content[msg.content.length - 1] as unknown as Record<string, unknown>
+      lastBlock.cache_control = { type: 'ephemeral' }
+    }
+
+    marked++
+  }
+}
+
+// ============================================================
 // ClaudeApiClient
 // ============================================================
 
@@ -221,6 +275,7 @@ export class ClaudeApiClient {
   private readonly maxRetries: number
   private readonly defaultModel: string
   private readonly usage: TokenUsage
+  private readonly enablePromptCache: boolean
 
   /** Per-request usage accumulator from streaming events. */
   private streamUsage: { inputTokens: number; outputTokens: number } = {
@@ -253,6 +308,7 @@ export class ClaudeApiClient {
 
     this.maxRetries = config?.maxRetries ?? DEFAULT_MAX_RETRIES
     this.defaultModel = config?.defaultModel ?? process.env['CC_AGENT_MODEL'] ?? 'claude-sonnet-4-20250514'
+    this.enablePromptCache = config?.enablePromptCache ?? false
 
     this.usage = {
       inputTokens: 0,
@@ -285,6 +341,13 @@ export class ClaudeApiClient {
     const formattedMessages = formatMessagesForApi(messages)
     const formattedTools = formatToolDefinitions(tools)
 
+    // ---- Prompt cache: add cache_control markers ----
+    // When enabled, the system prompt and last 2 user messages get
+    // cache_control breakpoints so the API can cache them across turns.
+    if (this.enablePromptCache) {
+      addCacheControlToRecentMessages(formattedMessages, 2)
+    }
+
     // Build base request parameters (immutable across retries)
     const baseParams: MessageCreateParams = {
       model,
@@ -294,7 +357,18 @@ export class ClaudeApiClient {
     }
 
     if (systemPrompt.length > 0) {
-      baseParams.system = systemPrompt
+      if (this.enablePromptCache) {
+        // Use the block-based system prompt with cache_control so the API
+        // can cache the (typically large) system prompt across turns.
+        const systemBlocks = [{
+          type: 'text' as const,
+          text: systemPrompt,
+          cache_control: { type: 'ephemeral' as const },
+        }]
+        ;(baseParams as unknown as Record<string, unknown>).system = systemBlocks
+      } else {
+        baseParams.system = systemPrompt
+      }
     }
 
     if (formattedTools.length > 0) {
@@ -633,30 +707,32 @@ export class ClaudeApiClient {
   // ----------------------------------------------------------
 
   /**
-   * Rough local token estimator. Uses the ~4 chars/token heuristic for
-   * English text. Intended as a fallback when the API is unavailable.
+   * Local token estimator with CJK awareness.
+   * Uses {@link estimateTokenCount} from the compact service for accurate
+   * estimation across ASCII and CJK text.  Intended as a fallback when the
+   * API count-tokens endpoint is unavailable.
    */
   private estimateTokensLocally(messages: Message[], systemPrompt?: string): number {
     let total = 0
 
     if (systemPrompt) {
-      total += Math.ceil(systemPrompt.length / 4)
+      total += estimateTokenCount(systemPrompt)
     }
 
     for (const msg of messages) {
       if (typeof msg.content === 'string') {
-        total += Math.ceil(msg.content.length / 4)
+        total += estimateTokenCount(msg.content)
       } else if (Array.isArray(msg.content)) {
         for (const block of msg.content as ContentBlock[]) {
           if (block.type === 'text') {
-            total += Math.ceil(block.text.length / 4)
+            total += estimateTokenCount(block.text)
           } else if (block.type === 'tool_result') {
             const content = block.content
             if (typeof content === 'string') {
-              total += Math.ceil(content.length / 4)
+              total += estimateTokenCount(content)
             }
           } else if (block.type === 'thinking') {
-            total += Math.ceil(block.thinking.length / 4)
+            total += estimateTokenCount(block.thinking)
           }
           // Image and tool_use blocks are not easily estimable; skip.
         }

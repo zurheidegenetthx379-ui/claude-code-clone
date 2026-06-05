@@ -12,6 +12,7 @@
 import { writeFile, mkdir, stat } from 'node:fs/promises'
 import { resolve, isAbsolute, dirname } from 'node:path'
 import { buildTool } from '../../Tool.js'
+import { checkPathAccessSync } from '../../utils/PathPolicy.js'
 import minimatch from 'minimatch'
 import type {
   ToolResult,
@@ -75,6 +76,18 @@ const FileWriteTool = buildTool({
     if (context.denyList.some((p) => minimatch(filePath, p, { matchBase: true }))) {
       return { behavior: 'deny', message: 'File path matches deny-list entry.' }
     }
+
+    // Enforce path boundaries (protected paths, cwd containment).
+    // Applied before mode-based shortcuts so protected paths (.git, .env, etc.)
+    // are always blocked regardless of permission mode.
+    const pathCheck = checkPathAccessSync(filePath, {
+      cwd: (context as unknown as { cwd?: string }).cwd ?? process.cwd(),
+      allowOutsideCwd: context.permissionMode === 'bypassPermissions',
+    })
+    if (!pathCheck.allowed) {
+      return { behavior: 'deny', message: pathCheck.reason }
+    }
+
     if (context.permissionMode === 'bypassPermissions') {
       return { behavior: 'allow' }
     }
