@@ -18,7 +18,7 @@
     "lint": "eslint src/ tests/ --max-warnings 0",
     "typecheck": "tsc --noEmit",
     "typecheck:strict": "tsc --noEmit --noUnusedLocals --noUnusedParameters",
-    "ci": "npm run typecheck && npm run test"
+    "ci": "npm run typecheck && npm run lint && npm run test && npm run build && npm audit --audit-level=moderate"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",

@@ -331,7 +331,8 @@ const BashTool = buildTool({
     return new Promise<ToolResult>((resolve) => {
       let stdout = ''
       let stderr = ''
-      let killed = false
+      let timedOut = false
+      let aborted = false
       let settled = false
 
       try {
@@ -349,7 +350,7 @@ const BashTool = buildTool({
 
         // ── Timeout handling ────────────────────────────────────────────────
         const timer = setTimeout(() => {
-          killed = true
+          timedOut = true
           child.kill('SIGTERM')
           // Force-kill after 5 s grace period
           setTimeout(() => {
@@ -360,7 +361,7 @@ const BashTool = buildTool({
         // ── Abort signal handling ───────────────────────────────────────────
         let abortKillTimer: ReturnType<typeof setTimeout> | undefined
         const onAbort = () => {
-          killed = true
+          aborted = true
           child.kill('SIGTERM')
           // Force-kill after 5 s grace period (mirrors timeout handler)
           abortKillTimer = setTimeout(() => {
@@ -379,7 +380,7 @@ const BashTool = buildTool({
         })
 
         // ── Completion ──────────────────────────────────────────────────────
-        child.on('close', (code, signal) => {
+        child.on('close', (code, _signal) => {
           if (settled) return
           settled = true
           clearTimeout(timer)
@@ -391,8 +392,10 @@ const BashTool = buildTool({
           // Build output sections
           const parts: string[] = []
 
-          if (killed && signal) {
-            parts.push(`Process killed (timed out after ${timeoutMs / 1000}s).`)
+          if (timedOut) {
+            parts.push(`Process killed: timed out after ${timeoutMs / 1000}s.`)
+          } else if (aborted) {
+            parts.push('Process killed: aborted by user.')
           }
 
           const trimmedStdout = stdout.trim()
@@ -414,7 +417,7 @@ const BashTool = buildTool({
 
           resolve({
             content: output,
-            isError: code !== null && code !== 0,
+            isError: timedOut || aborted || (code !== null && code !== 0),
           })
         })
 
