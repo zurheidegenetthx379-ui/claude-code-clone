@@ -25,6 +25,7 @@ import type {
   Attachment,
   CompactResult,
 } from '../../types/index.js'
+import { randomUUID } from 'node:crypto'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -377,7 +378,7 @@ export function compactConversation(
 
   const summaryMessage: Message = {
     id: `compact-summary-${Date.now()}`,
-    uuid: crypto.randomUUID(),
+    uuid: randomUUID(),
     role: 'user',
     content: summaryText,
     timestamp: Date.now(),

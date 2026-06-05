@@ -29,6 +29,9 @@ import WebFetchTool from './tools/WebFetchTool/index.js'
 import WebSearchTool from './tools/WebSearchTool/index.js'
 import GlobTool from './tools/GlobTool/index.js'
 import GrepTool from './tools/GrepTool/index.js'
+import FileWriteTool from './tools/FileWriteTool/index.js'
+import TodoWriteTool from './tools/TodoWriteTool/index.js'
+import TodoReadTool from './tools/TodoReadTool/index.js'
 
 // ============================================================
 // Tool Name Constants
@@ -62,6 +65,15 @@ export const GLOB_TOOL_NAME = 'Glob'
 /** Content regex search across files */
 export const GREP_TOOL_NAME = 'Grep'
 
+/** Write content to a file (create or overwrite) */
+export const FILE_WRITE_TOOL_NAME = 'FileWrite'
+
+/** Create and manage a structured task list */
+export const TODO_WRITE_TOOL_NAME = 'TodoWrite'
+
+/** Read the current structured task list */
+export const TODO_READ_TOOL_NAME = 'TodoRead'
+
 /**
  * Set of all built-in tool names for fast lookup
  */
@@ -75,6 +87,9 @@ export const ALL_BUILT_IN_TOOL_NAMES: ReadonlySet<string> = new Set([
   WEB_SEARCH_TOOL_NAME,
   GLOB_TOOL_NAME,
   GREP_TOOL_NAME,
+  FILE_WRITE_TOOL_NAME,
+  TODO_WRITE_TOOL_NAME,
+  TODO_READ_TOOL_NAME,
 ])
 
 // ============================================================
@@ -94,8 +109,11 @@ export function getAllBaseTools(): ToolInstance[] {
     BashTool,
     FileReadTool,
     FileEditTool,
+    FileWriteTool,
     GlobTool,
     GrepTool,
+    TodoWriteTool,
+    TodoReadTool,
     AgentTool,
     AskUserQuestionTool,
     WebFetchTool,

@@ -12,7 +12,13 @@
     "start": "node dist/entrypoints/cli.js",
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
-    "typecheck": "tsc --noEmit"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src/ tests/",
+    "typecheck": "tsc --noEmit",
+    "typecheck:strict": "tsc --noEmit --noUnusedLocals --noUnusedParameters",
+    "ci": "npm run typecheck && npm run test"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",

@@ -56,6 +56,8 @@ export interface QueryEngineEvents {
   text: (content: string) => void
   /** The model requested a tool invocation. */
   'tool:use': (toolUse: ToolUseBlock) => void
+  /** A partial tool input JSON fragment was received during streaming. */
+  'tool:input_delta': (data: { toolUseId: string; partialJson: string }) => void
   /** A tool finished executing. */
   'tool:result': (toolResult: ToolResultBlock) => void
   /** The model produced an extended-thinking block. */
@@ -648,6 +650,10 @@ export class QueryEngine {
           const tracker = toolTrackers.get(event.index)
           if (tracker) {
             tracker.rawInput += event.partialJson
+            this.emit('tool:input_delta', {
+              toolUseId: tracker.id,
+              partialJson: event.partialJson,
+            })
           }
           break
         }

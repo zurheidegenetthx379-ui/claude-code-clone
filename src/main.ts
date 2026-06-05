@@ -118,6 +118,8 @@ import { launchRepl } from './replLauncher.js'
 import { loadHooks, runHooks } from './services/hooks/hookRunner.js'
 import type { HookDefinition } from './types/index.js'
 
+import { buildEffectiveSystemPrompt } from './utils/systemPrompt.js'
+
 // ============================================================
 // Constants
 // ============================================================
@@ -238,12 +240,12 @@ interface AssembledRuntime {
   sandboxMode: SandboxMode
   /** Whether coordinator (multi-agent orchestration) mode is active. */
   coordinatorMode: boolean
-  /** Team registry for swarm mode (always present, empty when not in use). */
-  teamRegistry: TeamRegistry
-  /** File-based mailbox for inter-agent messaging. */
-  fileMailbox: FileMailbox
-  /** Background task registry for tracking async agents. */
-  backgroundTaskRegistry: BackgroundTaskRegistry
+  /** Team registry for swarm mode (present only when coordinator mode is active). */
+  teamRegistry?: TeamRegistry
+  /** File-based mailbox for inter-agent messaging (present only when coordinator mode is active). */
+  fileMailbox?: FileMailbox
+  /** Background task registry for tracking async agents (present only when coordinator mode is active). */
+  backgroundTaskRegistry?: BackgroundTaskRegistry
   /** Lifecycle hooks loaded from project configuration. */
   hooks: HookDefinition[]
 }
@@ -377,7 +379,11 @@ export async function runHeadless(options: HeadlessOptions): Promise<void> {
       } as any, runtime.cwd)
     } catch { /* best-effort */ }
 
-    const result: QueryResult = await engine.run(options.prompt)
+    const timeoutMs = parseInt(process.env.CC_HEADLESS_TIMEOUT_MS || '300000', 10) // 5 min default
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`Headless query timed out after ${timeoutMs}ms`)), timeoutMs)
+    )
+    const result: QueryResult = await Promise.race([engine.run(options.prompt), timeoutPromise])
 
     // Persist assistant response
     try {
@@ -501,42 +507,49 @@ export async function runSdkMode(options: SdkModeOptions): Promise<void> {
     crlfDelay: Infinity,
   })
 
-  for await (const line of rl) {
-    if (!line.trim()) continue
+  try {
+    for await (const line of rl) {
+      if (!line.trim()) continue
 
-    let request: { type: string; prompt?: string }
-    try {
-      request = JSON.parse(line)
-    } catch {
-      writeSdkResponse({ type: 'error', error: 'Invalid JSON on stdin' })
-      continue
-    }
-
-    if (request.type === 'query' && request.prompt) {
+      let request: { type: string; prompt?: string }
       try {
-        const result = await engine.run(request.prompt)
-        writeSdkResponse({
-          type: 'result',
-          text: result.text,
-          stopReason: result.stopReason,
-          turnsUsed: result.turnsUsed,
-          tokenUsage: result.tokenUsage,
-          costUsd: result.costUsd,
-          durationMs: result.durationMs,
-        })
-      } catch (err) {
-        writeSdkResponse({
-          type: 'error',
-          error: err instanceof Error ? err.message : String(err),
-        })
+        request = JSON.parse(line)
+      } catch {
+        writeSdkResponse({ type: 'error', error: 'Invalid JSON on stdin' })
+        continue
       }
-    } else if (request.type === 'abort') {
-      engine.abort()
-      writeSdkResponse({ type: 'aborted' })
-    } else if (request.type === 'shutdown') {
-      break
-    } else {
-      writeSdkResponse({ type: 'error', error: `Unknown request type: ${request.type}` })
+
+      if (request.type === 'query' && request.prompt) {
+        try {
+          const result = await engine.run(request.prompt)
+          writeSdkResponse({
+            type: 'result',
+            text: result.text,
+            stopReason: result.stopReason,
+            turnsUsed: result.turnsUsed,
+            tokenUsage: result.tokenUsage,
+            costUsd: result.costUsd,
+            durationMs: result.durationMs,
+          })
+        } catch (err) {
+          writeSdkResponse({
+            type: 'error',
+            error: err instanceof Error ? err.message : String(err),
+          })
+        }
+      } else if (request.type === 'abort') {
+        engine.abort()
+        writeSdkResponse({ type: 'aborted' })
+      } else if (request.type === 'shutdown') {
+        break
+      } else {
+        writeSdkResponse({ type: 'error', error: `Unknown request type: ${request.type}` })
+      }
+    }
+  } finally {
+    // Ensure MCP connections are torn down even if stdin processing throws.
+    if (runtime.mcpManager) {
+      await runtime.mcpManager.disconnectAll().catch(() => {})
     }
   }
 
@@ -552,7 +565,7 @@ export async function runSdkMode(options: SdkModeOptions): Promise<void> {
     }
   }
 
-  await runtime.mcpManager.disconnectAll()
+  // MCP disconnect is handled by the try/finally block above.
 }
 
 // ============================================================
@@ -914,13 +927,18 @@ async function assembleRuntime(options: {
   })
 
   // ---- System prompt ----
-  let systemPrompt = options.systemPrompt ?? buildDefaultSystemPrompt({
-    model: effectiveModel,
-    cwd,
+  // Use the priority-based system prompt assembler to unify override,
+  // coordinator, agent, custom, and default prompts in a single call.
+  const coordinatorMode = isCoordinatorMode()
+  const effectiveSystemPrompt = await buildEffectiveSystemPrompt({
     tools: filteredTools,
-    skills,
-    permissionMode: effectivePermissionMode,
+    model: effectiveModel,
+    overrideSystemPrompt: options.systemPrompt,
+    coordinatorSystemPrompt: coordinatorMode ? getCoordinatorSystemPrompt() : undefined,
+    isCoordinatorMode: coordinatorMode,
+    customSystemPrompt: projectSettings.systemPrompt,
   })
+  let systemPrompt = effectiveSystemPrompt.content
 
   // Apply project settings' system prompt addition (if provided).
   if (projectSettings.systemPrompt) {
@@ -997,22 +1015,16 @@ async function assembleRuntime(options: {
   )
 
   // ---- Coordinator mode ----
-  // When the CLAUDE_CODE_COORDINATOR_MODE environment variable is set, the
-  // system prompt is replaced with a coordinator-specific prompt that
-  // instructs the model to plan work, delegate to workers, and synthesize
-  // results.
-  const coordinatorMode = isCoordinatorMode()
-  if (coordinatorMode) {
-    systemPrompt = getCoordinatorSystemPrompt()
-  }
+  // Coordinator mode is already factored into the system prompt via
+  // buildEffectiveSystemPrompt above.  The swarm infrastructure below
+  // is instantiated conditionally based on the coordinatorMode flag.
 
   // ---- Swarm infrastructure ----
-  // The TeamRegistry, FileMailbox, and BackgroundTaskRegistry are always
-  // created, even when coordinator mode is inactive.  They are lightweight
-  // and only gain entries when swarm/team features are actively used.
-  const teamRegistry = new TeamRegistry()
-  const fileMailbox = new FileMailbox(cwd)
-  const backgroundTaskRegistry = new BackgroundTaskRegistry()
+  // Only instantiate the swarm primitives when coordinator mode is active.
+  // They are lightweight but unnecessary for single-agent sessions.
+  const teamRegistry = coordinatorMode ? new TeamRegistry() : undefined
+  const fileMailbox = coordinatorMode ? new FileMailbox(cwd) : undefined
+  const backgroundTaskRegistry = coordinatorMode ? new BackgroundTaskRegistry() : undefined
 
   // ---- Hooks ----
   // Load lifecycle hooks from project configuration (.cc-agent/hooks.json
@@ -1049,9 +1061,9 @@ async function assembleRuntime(options: {
     sandboxRuntimeConfig,
     sandboxMode,
     coordinatorMode,
-    teamRegistry,
-    fileMailbox,
-    backgroundTaskRegistry,
+    teamRegistry: teamRegistry ?? undefined,
+    fileMailbox: fileMailbox ?? undefined,
+    backgroundTaskRegistry: backgroundTaskRegistry ?? undefined,
     hooks,
   }
 }
@@ -1434,9 +1446,9 @@ async function handleCommand(
   }
 
   // Special post-processing for /model:
-  // After a successful model switch, recreate the engine with the new model.
+  // After a successful model switch, signal the REPL to recreate the engine.
+  // The REPL loop handles engine recreation via the 'reset' signal.
   if (commandName === 'model' && result.text?.startsWith('Model switched to:')) {
-    engine = createQueryEngine(runtime)
     return 'reset'
   }
 
@@ -1450,50 +1462,6 @@ async function handleCommand(
 /**
  * Build the default system prompt when none is provided via CLI.
  *
- * In production this delegates to `services/systemPrompt/index.ts`; here
- * we construct a functional baseline that covers the essentials.
- */
-function buildDefaultSystemPrompt(options: {
-  model: string
-  cwd: string
-  tools: ToolInstance[]
-  skills: SkillCommand[]
-  permissionMode: PermissionMode
-}): string {
-  const parts: string[] = []
-
-  parts.push('You are an AI coding assistant. You help users with software engineering tasks.')
-  parts.push('')
-  parts.push(`Current working directory: ${options.cwd}`)
-  parts.push(`Permission mode: ${options.permissionMode}`)
-  parts.push('')
-
-  // Tool descriptions.
-  if (options.tools.length > 0) {
-    parts.push('Available tools:')
-    for (const tool of options.tools) {
-      const desc = typeof tool.description === 'function'
-        ? tool.description()
-        : tool.description
-      parts.push(`- ${tool.name}: ${desc.slice(0, 200)}`)
-    }
-    parts.push('')
-  }
-
-  // Skill descriptions.
-  if (options.skills.length > 0) {
-    parts.push('Available skills:')
-    for (const skill of options.skills) {
-      parts.push(`- /${skill.name}: ${skill.description}`)
-    }
-    parts.push('')
-  }
-
-  parts.push('Be helpful, accurate, and concise. Use tools when appropriate.')
-
-  return parts.join('\n')
-}
-
 /**
  * Compose the full system prompt from the base and optional appendage.
  */
@@ -1543,12 +1511,12 @@ async function gracefulShutdown(
 
   // ---- Cancel all background agent tasks ----
   try {
-    const runningTasks = runtime.backgroundTaskRegistry.listTasks('running')
+    const runningTasks = runtime.backgroundTaskRegistry?.listTasks('running') ?? []
     if (runningTasks.length > 0) {
       console.error(
         `[shutdown] Cancelling ${runningTasks.length} background agent task(s)...`,
       )
-      runtime.backgroundTaskRegistry.cancelAll()
+      runtime.backgroundTaskRegistry?.cancelAll()
     }
   } catch (err) {
     console.error(
@@ -1559,12 +1527,12 @@ async function gracefulShutdown(
 
   // ---- Dissolve all teams and persist their final state ----
   try {
-    const teams = runtime.teamRegistry.listTeams()
+    const teams = runtime.teamRegistry?.listTeams() ?? []
     for (const team of teams) {
       try {
-        await runtime.teamRegistry.persistTeam(team.name, runtime.cwd)
+        await runtime.teamRegistry?.persistTeam(team.name, runtime.cwd)
       } catch { /* best-effort */ }
-      runtime.teamRegistry.dissolveTeam(team.name)
+      runtime.teamRegistry?.dissolveTeam(team.name)
     }
     if (teams.length > 0) {
       console.error(`[shutdown] Dissolved ${teams.length} team(s).`)

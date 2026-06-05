@@ -307,21 +307,22 @@ class AppStateStoreImpl implements AppStateStore {
   }
 
   /**
-   * Notify every registered listener with a fresh snapshot.
+   * Notify every registered listener with a single shared snapshot.
    *
-   * Errors thrown by individual listeners are caught and logged so that
-   * one misbehaving subscriber cannot break the notification chain.
+   * Only ONE snapshot is created per notification cycle and it is passed to
+   * every listener, avoiding redundant work when many subscribers are active.
+   *
+   * Errors thrown by individual listeners are silently swallowed so that
+   * one misbehaving subscriber cannot break the notification chain or
+   * spam the console during rapid state transitions.
    */
   private notify(): void {
-    const snap = this.snapshot()
+    const snap = this.snapshot()  // Create once, share across all listeners
     for (const listener of this.listeners) {
       try {
         listener(snap)
-      } catch (err) {
-        console.error(
-          '[AppStateStore] Listener error:',
-          err instanceof Error ? err.message : String(err),
-        )
+      } catch {
+        // Listener errors should not affect others
       }
     }
   }

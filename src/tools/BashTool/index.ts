@@ -29,8 +29,8 @@ import {
 import type { SandboxMode } from '../../utils/sandbox/sandbox-enforcer.js'
 import type { SandboxRuntimeConfig } from '../../utils/sandbox/sandbox-adapter.js'
 
-// Dynamic minimatch import for glob-pattern permission matching.
-import minimatch from 'minimatch'
+// minimatch is loaded dynamically inside checkPermissions to avoid blocking
+// the tool registration path with a synchronous CJS require.
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -151,6 +151,10 @@ const BashTool = buildTool({
   ): Promise<PermissionResult> {
     if (!context) return { behavior: 'allow' }
 
+    // Lazy-load minimatch on first permission check to avoid blocking tool
+    // registration with a synchronous CJS require.
+    const { default: minimatch } = await import('minimatch')
+
     const command = typeof input.command === 'string' ? input.command : ''
 
     // Extract the first token (command name) for prefix matching.
@@ -269,94 +273,107 @@ const BashTool = buildTool({
       let killed = false
       let settled = false
 
-      const child: ChildProcess = spawn(spawnCommand, spawnArgs, {
-        cwd,
-        env: {
-          ...spawnEnv,
-          // Force UTF-8 for child processes on all platforms
-          PYTHONIOENCODING: 'utf-8',
-          ...(isWindows ? {} : { LANG: (spawnEnv as Record<string, string | undefined>)['LANG'] ?? 'en_US.UTF-8' }),
-        },
-        stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true,
-      })
+      try {
+        const child: ChildProcess = spawn(spawnCommand, spawnArgs, {
+          cwd,
+          env: {
+            ...spawnEnv,
+            // Force UTF-8 for child processes on all platforms
+            PYTHONIOENCODING: 'utf-8',
+            ...(isWindows ? {} : { LANG: (spawnEnv as Record<string, string | undefined>)['LANG'] ?? 'en_US.UTF-8' }),
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+          windowsHide: true,
+        })
 
-      // ── Timeout handling ────────────────────────────────────────────────
-      const timer = setTimeout(() => {
-        killed = true
-        child.kill('SIGTERM')
-        // Force-kill after 5 s grace period
-        setTimeout(() => {
-          if (!child.killed) child.kill('SIGKILL')
-        }, 5_000)
-      }, timeoutMs)
+        // ── Timeout handling ────────────────────────────────────────────────
+        const timer = setTimeout(() => {
+          killed = true
+          child.kill('SIGTERM')
+          // Force-kill after 5 s grace period
+          setTimeout(() => {
+            if (!child.killed) child.kill('SIGKILL')
+          }, 5_000)
+        }, timeoutMs)
 
-      // ── Abort signal handling ───────────────────────────────────────────
-      const onAbort = () => {
-        killed = true
-        child.kill('SIGTERM')
+        // ── Abort signal handling ───────────────────────────────────────────
+        const onAbort = () => {
+          killed = true
+          child.kill('SIGTERM')
+        }
+        context.abortController.signal.addEventListener('abort', onAbort, { once: true })
+
+        // ── Stream capture ──────────────────────────────────────────────────
+        child.stdout?.on('data', (chunk: Buffer) => {
+          stdout += chunk.toString('utf-8')
+        })
+
+        child.stderr?.on('data', (chunk: Buffer) => {
+          stderr += chunk.toString('utf-8')
+        })
+
+        // ── Completion ──────────────────────────────────────────────────────
+        child.on('close', (code, signal) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          context.abortController.signal.removeEventListener('abort', onAbort)
+
+          onProgress?.({ status: 'done', progress: 1 })
+
+          // Build output sections
+          const parts: string[] = []
+
+          if (killed && signal) {
+            parts.push(`Process killed (timed out after ${timeoutMs / 1000}s).`)
+          }
+
+          const trimmedStdout = stdout.trim()
+          const trimmedStderr = stderr.trim()
+
+          if (trimmedStdout) {
+            parts.push(truncateOutput(trimmedStdout, MAX_OUTPUT_BYTES))
+          }
+
+          if (trimmedStderr) {
+            parts.push(`[stderr]\n${truncateOutput(trimmedStderr, MAX_OUTPUT_BYTES)}`)
+          }
+
+          if (code !== null && code !== 0) {
+            parts.push(`Exit code: ${code}`)
+          }
+
+          const output = parts.length > 0 ? parts.join('\n\n') : '(no output)'
+
+          resolve({
+            content: output,
+            isError: code !== null && code !== 0,
+          })
+        })
+
+        child.on('error', (err: Error) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          context.abortController.signal.removeEventListener('abort', onAbort)
+
+          resolve({
+            content: `Failed to execute command: ${err.message}`,
+            isError: true,
+          })
+        })
+      } catch (err) {
+        // spawn() itself threw (e.g. invalid arguments, ENOENT on shell binary).
+        // Resolve with an error result rather than rejecting the Promise so the
+        // caller's error-handling path is consistent.
+        if (!settled) {
+          settled = true
+          resolve({
+            content: `Failed to execute command: ${String(err)}`,
+            isError: true,
+          })
+        }
       }
-      context.abortController.signal.addEventListener('abort', onAbort, { once: true })
-
-      // ── Stream capture ──────────────────────────────────────────────────
-      child.stdout?.on('data', (chunk: Buffer) => {
-        stdout += chunk.toString('utf-8')
-      })
-
-      child.stderr?.on('data', (chunk: Buffer) => {
-        stderr += chunk.toString('utf-8')
-      })
-
-      // ── Completion ──────────────────────────────────────────────────────
-      child.on('close', (code, signal) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        context.abortController.signal.removeEventListener('abort', onAbort)
-
-        onProgress?.({ status: 'done', progress: 1 })
-
-        // Build output sections
-        const parts: string[] = []
-
-        if (killed && signal) {
-          parts.push(`Process killed (timed out after ${timeoutMs / 1000}s).`)
-        }
-
-        const trimmedStdout = stdout.trim()
-        const trimmedStderr = stderr.trim()
-
-        if (trimmedStdout) {
-          parts.push(truncateOutput(trimmedStdout, MAX_OUTPUT_BYTES))
-        }
-
-        if (trimmedStderr) {
-          parts.push(`[stderr]\n${truncateOutput(trimmedStderr, MAX_OUTPUT_BYTES)}`)
-        }
-
-        if (code !== null && code !== 0) {
-          parts.push(`Exit code: ${code}`)
-        }
-
-        const output = parts.length > 0 ? parts.join('\n\n') : '(no output)'
-
-        resolve({
-          content: output,
-          isError: code !== null && code !== 0,
-        })
-      })
-
-      child.on('error', (err: Error) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        context.abortController.signal.removeEventListener('abort', onAbort)
-
-        resolve({
-          content: `Failed to execute command: ${err.message}`,
-          isError: true,
-        })
-      })
     })
   },
 
