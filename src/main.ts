@@ -63,6 +63,7 @@ import { QueryEngine } from './QueryEngine.js'
 import type { QueryEngineConfig, QueryResult } from './QueryEngine.js'
 
 import * as sessionStorage from './utils/sessionStorage.js'
+import type { TranscriptEntry } from './utils/sessionStorage.js'
 
 import {
   shouldExtractMemory,
@@ -753,9 +754,8 @@ export async function processUserInput(
       uuid: userMsgId,
       sessionId: runtime.sessionId,
       timestamp: Date.now(),
-      role: 'user',
       content: prompt,
-    } as any, runtime.cwd)
+    } satisfies TranscriptEntry, runtime.cwd)
   } catch { /* persistence is best-effort */ }
 
   try {
@@ -768,10 +768,9 @@ export async function processUserInput(
         uuid: randomUUID(),
         sessionId: runtime.sessionId,
         timestamp: Date.now(),
-        role: 'assistant',
         content: result.text,
         parentUuid: userMsgId,
-      } as any, runtime.cwd)
+      } satisfies TranscriptEntry, runtime.cwd)
     } catch { /* best-effort */ }
 
     // Ensure output ends on a new line.

@@ -178,7 +178,7 @@ const BashTool = buildTool({
     // `.env`, `.git/config`, etc. that the old regex missed).  Applied before
     // mode-based shortcuts so protected paths are always blocked regardless
     // of permission mode.
-    const cwd = (context as unknown as { cwd?: string }).cwd ?? process.cwd()
+    const cwd = context.cwd
     const allowOutsideCwd = context.permissionMode === 'bypassPermissions'
     const extractedPaths = extractFilePaths(command)
 
@@ -358,9 +358,14 @@ const BashTool = buildTool({
         }, timeoutMs)
 
         // ── Abort signal handling ───────────────────────────────────────────
+        let abortKillTimer: ReturnType<typeof setTimeout> | undefined
         const onAbort = () => {
           killed = true
           child.kill('SIGTERM')
+          // Force-kill after 5 s grace period (mirrors timeout handler)
+          abortKillTimer = setTimeout(() => {
+            if (!child.killed) child.kill('SIGKILL')
+          }, 5_000)
         }
         context.abortController.signal.addEventListener('abort', onAbort, { once: true })
 
@@ -378,6 +383,7 @@ const BashTool = buildTool({
           if (settled) return
           settled = true
           clearTimeout(timer)
+          if (abortKillTimer) clearTimeout(abortKillTimer)
           context.abortController.signal.removeEventListener('abort', onAbort)
 
           onProgress?.({ status: 'done', progress: 1 })
@@ -416,6 +422,7 @@ const BashTool = buildTool({
           if (settled) return
           settled = true
           clearTimeout(timer)
+          if (abortKillTimer) clearTimeout(abortKillTimer)
           context.abortController.signal.removeEventListener('abort', onAbort)
 
           resolve({

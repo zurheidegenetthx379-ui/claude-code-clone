@@ -17,6 +17,7 @@ import {
 import type { HeadlessOptions } from '../main.js'
 
 import * as sessionStorage from '../utils/sessionStorage.js'
+import type { TranscriptEntry } from '../utils/sessionStorage.js'
 import { runHooks } from '../services/hooks/hookRunner.js'
 import type { QueryResult } from '../QueryEngine.js'
 
@@ -60,9 +61,8 @@ export async function runHeadless(options: HeadlessOptions): Promise<void> {
         uuid: userMsgId,
         sessionId: runtime.sessionId,
         timestamp: Date.now(),
-        role: 'user',
         content: options.prompt,
-      } as any, runtime.cwd)
+      } satisfies TranscriptEntry, runtime.cwd)
     } catch { /* best-effort */ }
 
     const timeoutMs = parseInt(process.env.CC_HEADLESS_TIMEOUT_MS || '300000', 10) // 5 min default
@@ -91,10 +91,9 @@ export async function runHeadless(options: HeadlessOptions): Promise<void> {
         uuid: randomUUID(),
         sessionId: runtime.sessionId,
         timestamp: Date.now(),
-        role: 'assistant',
         content: result.text,
         parentUuid: userMsgId,
-      } as any, runtime.cwd)
+      } satisfies TranscriptEntry, runtime.cwd)
     } catch { /* best-effort */ }
 
     if (options.outputFormat === 'json') {

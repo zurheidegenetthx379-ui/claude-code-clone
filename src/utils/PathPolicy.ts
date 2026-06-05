@@ -62,11 +62,16 @@ export async function checkPathAccess(
     // Also check absolute protected paths
     const absSegments = resolved.split(/[/\\]/)
     if (absSegments.includes(protected_)) {
-      // Allow .env.example but not .env
-      if (protected_ === '.env' && absSegments.some(s => s.startsWith('.env.'))) continue
-      if (protected_ !== '.env') {
-        return { allowed: false, reason: `Access denied: path traverses protected directory "${protected_}"`, resolvedPath: resolved }
+      if (protected_ === '.env') {
+        // Allow .env.example / .env.production.example but deny bare .env
+        const hasBareEnv = absSegments.some(s => s === '.env')
+        if (hasBareEnv) {
+          return { allowed: false, reason: `Access denied: path contains protected file ".env"`, resolvedPath: resolved }
+        }
+        // Segment is a .env.* variant (e.g. .env.example) — allow
+        continue
       }
+      return { allowed: false, reason: `Access denied: path traverses protected directory "${protected_}"`, resolvedPath: resolved }
     }
   }
 
@@ -112,11 +117,16 @@ export function checkPathAccessSync(
     // Also check absolute path segments for protected directories
     const absSegments = resolved.split(/[/\\]/)
     if (absSegments.includes(protected_)) {
-      // Allow .env.example but not .env
-      if (protected_ === '.env' && absSegments.some(s => s.startsWith('.env.'))) continue
-      if (protected_ !== '.env') {
-        return { allowed: false, reason: `Access denied: path traverses protected directory "${protected_}"`, resolvedPath: resolved }
+      if (protected_ === '.env') {
+        // Allow .env.example / .env.production.example but deny bare .env
+        const hasBareEnv = absSegments.some(s => s === '.env')
+        if (hasBareEnv) {
+          return { allowed: false, reason: `Access denied: path contains protected file ".env"`, resolvedPath: resolved }
+        }
+        // Segment is a .env.* variant (e.g. .env.example) — allow
+        continue
       }
+      return { allowed: false, reason: `Access denied: path traverses protected directory "${protected_}"`, resolvedPath: resolved }
     }
   }
 
