@@ -8,7 +8,7 @@
     "cc-agent": "dist/entrypoints/cli.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node -e \"require('fs').mkdirSync('dist/web',{recursive:true});require('fs').copyFileSync('src/web/index.html','dist/web/index.html')\"",
     "start": "node dist/entrypoints/cli.js",
     "dev": "tsc --watch",
     "clean": "rm -rf dist",

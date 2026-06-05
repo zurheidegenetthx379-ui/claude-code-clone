@@ -123,6 +123,10 @@ HEADLESS MODE:
   -p, --print <prompt>       Run in headless mode (pipe response to stdout)
   --sdk                      Enable SDK mode (JSON protocol on stdin/stdout)
 
+WEB UI MODE:
+  --web                      Start browser-based chat UI
+  --port <number>            Web UI port (default: 3000)
+
 REPL MODE:
   (default)                  Start interactive REPL
   --ink                      Start REPL with React+Ink terminal UI
@@ -324,6 +328,28 @@ async function main(): Promise<void> {
   // Fast-path: SDK mode
   if (args.includes('--sdk')) {
     await runSdkMode(args)
+    return
+  }
+
+  // Fast-path: Web UI mode
+  if (args.includes('--web')) {
+    const options = parseOptions(args.filter(a => a !== '--web'))
+    const portIndex = args.indexOf('--port')
+    const port = portIndex >= 0 ? parseInt(args[portIndex + 1] ?? '3000', 10) : 3000
+
+    const { startWebServer } = await import('../main.js')
+    await startWebServer({
+      port,
+      model: options.model,
+      systemPrompt: options.systemPrompt,
+      appendSystemPrompt: options.appendSystemPrompt,
+      permissionMode: options.permissionMode,
+      maxTokens: options.maxTokens,
+      temperature: options.temperature,
+      cwd: options.cwd || process.cwd(),
+      allowList: options.allowList,
+      denyList: options.denyList,
+    })
     return
   }
 

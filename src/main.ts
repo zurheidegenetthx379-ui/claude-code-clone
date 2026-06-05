@@ -130,6 +130,7 @@ export { runHeadless } from './modes/headless-mode.js'
 export { runSdkMode } from './modes/sdk-mode.js'
 export { startRepl } from './modes/repl-mode.js'
 export { startInkRepl } from './modes/ink-mode.js'
+export { startWebServer } from './modes/web-mode.js'
 
 // ============================================================
 // Constants
