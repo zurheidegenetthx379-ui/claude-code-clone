@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.cc-agent/sessions/
+.cc-agent/memory/
+.cc-agent/teams/
+.cc-agent/mailbox/
+.session-memory/
+*.js.map
+.env
+.env.local
+*.jsonl
+test-edit.txt
