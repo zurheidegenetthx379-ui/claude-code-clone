@@ -8,6 +8,12 @@
 
 import { randomUUID } from 'node:crypto'
 
+// Node v24 + @anthropic-ai/sdk: the SDK internally creates a readline interface
+// for CLI progress bars.  In pipe / headless mode stdin is already closed, so
+// Node v24 throws "readline was closed".  Silencing stdin errors here is safe
+// because headless mode never reads from stdin.
+process.stdin.on('error', () => {})
+
 import {
   assembleRuntime,
   createQueryEngine,
