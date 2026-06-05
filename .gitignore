@@ -10,3 +10,6 @@ dist/
 .env.local
 *.jsonl
 test-edit.txt
+test-subagent.mjs
+hello.txt
+summary.md
