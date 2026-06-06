@@ -14,3 +14,4 @@ test-subagent.mjs
 hello.txt
 summary.md
 *.zip
+*.log
