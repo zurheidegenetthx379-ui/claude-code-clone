@@ -505,6 +505,14 @@ export class QueryEngine {
     let stopReason = ''
     let runError: Error | undefined
 
+    // ── Loop detection state ────────────────────────────────────────────
+    // Track recent tool call signatures to detect repetition loops.
+    const recentToolSignatures: string[] = []
+    let consecutiveToolOnlyTurns = 0
+    const MAX_REPEATED_TOOL_CALLS = 3
+    const MAX_TOOL_ONLY_TURNS = 8
+    const RECENT_HISTORY_SIZE = 10
+
     try {
       while (this.state.turnsCompleted < this.config.maxTurns) {
         // Check abort
@@ -528,6 +536,13 @@ export class QueryEngine {
           }
         }
 
+        // ── Loop detection: track text vs tool-only turns ─────────────
+        if (textParts.length > 0 && textParts.join('').trim().length > 0) {
+          consecutiveToolOnlyTurns = 0 // Reset — model produced text
+        } else if (toolUseBlocks.length > 0) {
+          consecutiveToolOnlyTurns += 1
+        }
+
         // Record the assistant turn in the transcript
         const assistantMessage = this.createMessage('assistant', assistantBlocks)
         this.state.messages.push(assistantMessage)
@@ -537,6 +552,44 @@ export class QueryEngine {
           finalText = textParts.join('')
           finalContent = assistantBlocks
           stopReason = stopReason || 'end_turn'
+          break
+        }
+
+        // ── Loop detection: repeated tool calls ───────────────────────
+        // Build signatures for this batch of tool calls.
+        const batchSignatures = toolUseBlocks.map(
+          (tc) => `${tc.name}:${JSON.stringify(tc.input).slice(0, 200)}`,
+        )
+        recentToolSignatures.push(...batchSignatures)
+        if (recentToolSignatures.length > RECENT_HISTORY_SIZE) {
+          recentToolSignatures.splice(0, recentToolSignatures.length - RECENT_HISTORY_SIZE)
+        }
+
+        // Check for repeated identical tool calls (3+ in a row).
+        if (recentToolSignatures.length >= MAX_REPEATED_TOOL_CALLS) {
+          const last = recentToolSignatures[recentToolSignatures.length - 1]
+          const allSame = recentToolSignatures
+            .slice(-MAX_REPEATED_TOOL_CALLS)
+            .every((s) => s === last)
+
+          if (allSame) {
+            stopReason = 'loop_detected'
+            finalText = textParts.join('') ||
+              `[Execution stopped: the model called "${toolUseBlocks[0]?.name}" with identical arguments ${MAX_REPEATED_TOOL_CALLS} times in a row. This usually indicates a loop. Please rephrase your question or break the task into smaller steps.]`
+            finalContent = assistantBlocks
+            this.emit('text', `\n${finalText}\n`)
+            break
+          }
+        }
+
+        // ── Loop detection: too many consecutive tool-only turns ──────
+        if (consecutiveToolOnlyTurns >= MAX_TOOL_ONLY_TURNS) {
+          stopReason = 'loop_detected'
+          finalText =
+            `[Execution stopped: ${MAX_TOOL_ONLY_TURNS} consecutive turns with only tool calls and no text response. ` +
+            `The model appears to be going in circles. Try rephrasing your question or breaking the task into smaller steps.]`
+          finalContent = assistantBlocks
+          this.emit('text', `\n${finalText}\n`)
           break
         }
 
