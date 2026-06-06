@@ -13,3 +13,4 @@ test-edit.txt
 test-subagent.mjs
 hello.txt
 summary.md
+*.zip

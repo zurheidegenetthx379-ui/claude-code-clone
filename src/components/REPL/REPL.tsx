@@ -31,6 +31,7 @@ import type {
 import type { ApprovalBridge, PendingApproval } from '../../utils/ApprovalBridge.js'
 import type { CommandContext } from '../../commands.js'
 import { executeCommand } from '../../commands.js'
+import { MarkdownText } from '../MarkdownText.js'
 import { compactConversation } from '../../services/compact/compact.js'
 import { getEffectiveContextWindowSize } from '../../utils/context.js'
 
@@ -532,12 +533,18 @@ export function REPL(props: REPLProps): React.ReactElement {
             )}
           </Box>
           <Box paddingLeft={2}>
-            <Text
-              color={entry.isError ? 'red' : color}
-              wrap="wrap"
-            >
-              {entry.content}
-            </Text>
+            {entry.role === 'assistant' ? (
+              // Assistant messages get full Markdown rendering (headings,
+              // bold/italic, code blocks, lists, etc.) via marked-terminal.
+              <MarkdownText>{entry.content}</MarkdownText>
+            ) : (
+              <Text
+                color={entry.isError ? 'red' : color}
+                wrap="wrap"
+              >
+                {entry.content}
+              </Text>
+            )}
           </Box>
         </Box>
       )
