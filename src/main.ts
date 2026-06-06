@@ -62,6 +62,8 @@ import { compactConversation } from './services/compact/compact.js'
 import { QueryEngine } from './QueryEngine.js'
 import type { QueryEngineConfig, QueryResult } from './QueryEngine.js'
 
+import { StreamingMarkdownRenderer } from './utils/terminalRenderer.js'
+
 import * as sessionStorage from './utils/sessionStorage.js'
 import type { TranscriptEntry } from './utils/sessionStorage.js'
 
@@ -661,18 +663,40 @@ export function createQueryEngine(
 
   const engine = new QueryEngine(config)
 
+  // ── Streaming markdown renderer (TTY interactive mode only) ──────
+  // When stdout is a TTY and we're not in silent/fullySilent mode, use
+  // a StreamingMarkdownRenderer to display rich markdown in real-time
+  // with ANSI cursor control.  In pipe mode, fall back to raw write.
+  const useRenderer = process.stdout.isTTY === true && !options.silent && !options.fullySilent
+  let streamRenderer: StreamingMarkdownRenderer | null = null
+
   // Wire up event listeners for console output.
   // In silent mode, skip text streaming — the caller handles output.
   if (!options.silent && !options.fullySilent) {
     engine.on('text', (content: string) => {
-      process.stdout.write(content)
+      if (useRenderer) {
+        if (!streamRenderer) {
+          streamRenderer = new StreamingMarkdownRenderer()
+          streamRenderer.start()
+        }
+        streamRenderer.update(content)
+      } else {
+        process.stdout.write(content)
+      }
     })
   }
 
   // In fullySilent mode (Ink TUI), skip all stderr logging —
   // the UI component handles its own display via engine events.
   if (!options.fullySilent) {
+    // When a tool call starts, finalize the current text segment so that
+    // stderr tool output does not corrupt the cursor position.  The next
+    // text chunk will create a fresh renderer.
     engine.on('tool:use', (toolUse) => {
+      if (streamRenderer) {
+        streamRenderer.finalize()
+        streamRenderer = null
+      }
       console.error(`\n[tool] ${toolUse.name}(${JSON.stringify(toolUse.input).slice(0, 120)})`)
     })
 
@@ -685,6 +709,11 @@ export function createQueryEngine(
     })
 
     engine.on('done', (result: QueryResult) => {
+      // Finalize any active streaming renderer before logging stats.
+      if (streamRenderer) {
+        streamRenderer.finalize()
+        streamRenderer = null
+      }
       if (result.stopReason && result.stopReason !== 'end_turn') {
         console.error(`\n[stopped: ${result.stopReason}]`)
       }
@@ -695,6 +724,11 @@ export function createQueryEngine(
     })
 
     engine.on('error', (error: Error) => {
+      // Finalize streaming on error — render what we have.
+      if (streamRenderer) {
+        streamRenderer.finalize()
+        streamRenderer = null
+      }
       console.error(`\n[error] ${error.message}`)
     })
   }
