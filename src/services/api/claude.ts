@@ -273,7 +273,7 @@ function addCacheControlToRecentMessages(
 export class ClaudeApiClient {
   private readonly client: Anthropic
   private readonly maxRetries: number
-  private readonly defaultModel: string
+  readonly defaultModel: string
   private readonly usage: TokenUsage
   private readonly enablePromptCache: boolean
 

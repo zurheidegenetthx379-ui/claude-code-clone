@@ -21,8 +21,10 @@
 import { EventEmitter } from 'node:events'
 import { randomUUID } from 'node:crypto'
 
-import { ClaudeApiClient, createApiClient } from './services/api/claude.js'
+import { createApiClient } from './services/api/claude.js'
 import type { TokenUsage, StreamOptions } from './services/api/claude.js'
+import type { ProviderAdapter } from './services/api/provider.js'
+import { createProvider } from './services/api/provider.js'
 import type {
   ContentBlock,
   HookDefinition,
@@ -91,9 +93,10 @@ export interface QueryEngineConfig {
   sessionId: string
   /**
    * Pre-configured API client. When provided, `apiKey` and `baseUrl` are
-   * ignored.
+   * ignored. Accepts any ProviderAdapter implementation (Anthropic, OpenAI,
+   * or custom).
    */
-  apiClient?: ClaudeApiClient
+  apiClient?: ProviderAdapter
   /** API key (used only when `apiClient` is not supplied). */
   apiKey?: string
   /** Base URL override (used only when `apiClient` is not supplied). */
@@ -223,7 +226,7 @@ export class QueryEngine {
     Pick<QueryEngineConfig, 'model' | 'maxTokens' | 'maxTurns'>
   > &
     QueryEngineConfig
-  private readonly apiClient: ClaudeApiClient
+  private readonly apiClient: ProviderAdapter
   private readonly emitter: EventEmitter
 
   private abortController: AbortController
@@ -256,6 +259,36 @@ export class QueryEngine {
     this.abortController = new AbortController()
 
     this.state = this.createInitialState()
+  }
+
+  /**
+   * Async factory: creates a QueryEngine with automatic provider detection.
+   *
+   * Use this instead of `new QueryEngine(config)` when you want multi-provider
+   * support (the constructor defaults to Anthropic for backward compatibility).
+   *
+   * @example
+   * ```ts
+   * const engine = await QueryEngine.create({
+   *   model: 'gpt-4o',
+   *   provider: 'openai',
+   *   // ... other config
+   * })
+   * ```
+   */
+  static async create(config: QueryEngineConfig & { provider?: 'anthropic' | 'openai' }): Promise<QueryEngine> {
+    if (config.apiClient) {
+      return new QueryEngine(config)
+    }
+
+    const adapter = await createProvider({
+      provider: config.provider,
+      apiKey: config.apiKey,
+      baseUrl: config.baseUrl,
+      defaultModel: config.model,
+    })
+
+    return new QueryEngine({ ...config, apiClient: adapter })
   }
 
   // ==========================================================
