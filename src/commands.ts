@@ -23,9 +23,13 @@
 import type {
   AppState,
   ToolInstance,
+  ContentBlock,
 } from './types/index.js'
 import type { QueryEngine } from './QueryEngine.js'
 import type { TokenUsage } from './services/api/claude.js'
+import { readFile, writeFile, access } from 'node:fs/promises'
+import { join, relative } from 'node:path'
+import { execSync } from 'node:child_process'
 
 // ============================================================
 // Command Types
@@ -524,6 +528,210 @@ export const BUILT_IN_COMMANDS: ReadonlyArray<Command> = [
       return { text: 'No query in progress.' }
     },
   },
+
+  // ── /init ─────────────────────────────────────────────────────────────
+  {
+    name: 'init',
+    description: 'Create a CLAUDE.md project context file in the current directory.',
+    isEnabled: true,
+    isHidden: false,
+
+    async execute(_args: string, context: CommandContext): Promise<CommandResult> {
+      const projectFile = join(context.cwd, 'CLAUDE.md')
+
+      // Check if CLAUDE.md already exists.
+      let exists = false
+      try {
+        await access(projectFile)
+        exists = true
+      } catch {
+        // File does not exist — proceed with creation.
+      }
+
+      if (exists) {
+        return {
+          error: `CLAUDE.md already exists at ${projectFile}. Delete it first or edit it manually.`,
+        }
+      }
+
+      // ── Gather project context ──────────────────────────────────────
+      const projectName = await detectProjectName(context.cwd)
+      const projectType = await detectProjectType(context.cwd)
+      const gitInfo = detectGitInfo(context.cwd)
+      const dirStructure = await detectDirectoryStructure(context.cwd)
+
+      // ── Build CLAUDE.md content ─────────────────────────────────────
+      const lines: string[] = [
+        `# ${projectName}`,
+        '',
+        '## Project Overview',
+        '',
+        projectType.description,
+        '',
+        '## Tech Stack',
+        '',
+        ...projectType.techStack.map(t => `- ${t}`),
+        '',
+        '## Directory Structure',
+        '',
+        '```',
+        ...dirStructure,
+        '```',
+        '',
+      ]
+
+      if (gitInfo) {
+        lines.push(
+          '## Git Information',
+          '',
+          `- Default branch: ${gitInfo.defaultBranch}`,
+          `- Remote: ${gitInfo.remote}`,
+          '',
+        )
+      }
+
+      lines.push(
+        '## Coding Conventions',
+        '',
+        '- Follow the existing code style in the project.',
+        `- Language: ${projectType.primaryLanguage}`,
+        '',
+        '## Build & Test Commands',
+        '',
+      )
+
+      if (projectType.buildCmd) {
+        lines.push(`- Build: \`${projectType.buildCmd}\``)
+      }
+      if (projectType.testCmd) {
+        lines.push(`- Test: \`${projectType.testCmd}\``)
+      }
+      if (projectType.lintCmd) {
+        lines.push(`- Lint: \`${projectType.lintCmd}\``)
+      }
+
+      lines.push(
+        '',
+        '## Key Files',
+        '',
+        '- Add important files and their purposes here.',
+        '',
+      )
+
+      const content = lines.join('\n')
+
+      try {
+        await writeFile(projectFile, content, 'utf-8')
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err)
+        return { error: `Failed to create CLAUDE.md: ${detail}` }
+      }
+
+      return {
+        text: `Created CLAUDE.md at ${relative(context.cwd, projectFile) || 'CLAUDE.md'}. ` +
+          `Edit it to customize project context for the AI agent.`,
+      }
+    },
+  },
+
+  // ── /review ───────────────────────────────────────────────────────────
+  {
+    name: 'review',
+    description: 'Summarize the current conversation: turns, tools used, and key topics.',
+    isEnabled: true,
+    isHidden: false,
+
+    async execute(_args: string, context: CommandContext): Promise<CommandResult> {
+      const messages = context.appState.messages
+      const usage = context.sessionTokenUsage
+      const cost = context.sessionCostUsd
+
+      if (messages.length === 0) {
+        return { text: 'No conversation to review. Start by sending a message!' }
+      }
+
+      // ── Count messages by role ──────────────────────────────────────
+      const counts: Record<string, number> = {}
+      const toolNames = new Set<string>()
+      const userTopics: string[] = []
+
+      for (const msg of messages) {
+        const role = msg.role
+        counts[role] = (counts[role] ?? 0) + 1
+
+        // Collect tool names from assistant tool_use blocks.
+        if (role === 'assistant' && Array.isArray(msg.content)) {
+          for (const block of msg.content as ContentBlock[]) {
+            if (block.type === 'tool_use') {
+              toolNames.add(block.name)
+            }
+          }
+        }
+
+        // Capture first ~80 chars of user messages as topic hints.
+        if (role === 'user') {
+          let text = ''
+          if (typeof msg.content === 'string') {
+            text = msg.content
+          } else if (Array.isArray(msg.content)) {
+            text = (msg.content as ContentBlock[])
+              .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+              .map(b => b.text)
+              .join(' ')
+          }
+          if (text.trim()) {
+            const preview = text.trim().slice(0, 80)
+            userTopics.push(preview + (text.length > 80 ? '...' : ''))
+          }
+        }
+      }
+
+      // ── Build review output ─────────────────────────────────────────
+      const lines: string[] = [
+        '## Conversation Review',
+        '',
+        `**Messages:** ${messages.length} total`,
+      ]
+
+      for (const [role, count] of Object.entries(counts)) {
+        lines.push(`  - ${role}: ${count}`)
+      }
+
+      lines.push('')
+
+      // Turns = number of user→assistant exchanges.
+      const turns = counts['user'] ?? 0
+      lines.push(`**Turns:** ${turns}`)
+
+      // Tools used.
+      if (toolNames.size > 0) {
+        lines.push('')
+        lines.push(`**Tools used:** ${[...toolNames].join(', ')}`)
+      }
+
+      // Token usage.
+      if (usage) {
+        const total = usage.inputTokens + usage.outputTokens
+        lines.push('')
+        lines.push(`**Tokens:** ${formatNumber(total)} total (${formatNumber(usage.inputTokens)} in / ${formatNumber(usage.outputTokens)} out)`)
+      }
+
+      if (cost !== undefined && cost > 0) {
+        lines.push(`**Estimated cost:** $${cost.toFixed(4)} USD`)
+      }
+
+      // User topics (prompts).
+      if (userTopics.length > 0) {
+        lines.push('')
+        lines.push('**User prompts:**')
+        for (let i = 0; i < userTopics.length; i++) {
+          lines.push(`  ${i + 1}. ${userTopics[i]}`)
+        }
+      }
+
+      return { text: lines.join('\n') }
+    },
+  },
 ]
 
 // ============================================================
@@ -767,4 +975,211 @@ function levenshtein(a: string, b: string): number {
 export function isSlashCommand(input: string): boolean {
   const trimmed = input.trim()
   return /^\/[a-zA-Z]/.test(trimmed)
+}
+
+// ============================================================
+// /init Helper Functions
+// ============================================================
+
+/** Result of project type detection. */
+interface ProjectTypeInfo {
+  description: string
+  primaryLanguage: string
+  techStack: string[]
+  buildCmd?: string
+  testCmd?: string
+  lintCmd?: string
+}
+
+/** Try to read and parse package.json from the given directory. */
+async function readPackageJson(cwd: string): Promise<Record<string, unknown> | null> {
+  try {
+    const raw = await readFile(join(cwd, 'package.json'), 'utf-8')
+    return JSON.parse(raw) as Record<string, unknown>
+  } catch {
+    return null
+  }
+}
+
+/** Detect the project name from package.json or directory name. */
+async function detectProjectName(cwd: string): Promise<string> {
+  const pkg = await readPackageJson(cwd)
+  if (pkg && typeof pkg.name === 'string') return pkg.name
+
+  // Fallback: use the directory basename.
+  const parts = cwd.replace(/[\\/]+$/, '').split(/[\\/]/)
+  return parts[parts.length - 1] ?? 'project'
+}
+
+/** Detect project type, tech stack, and common commands from package.json. */
+async function detectProjectType(cwd: string): Promise<ProjectTypeInfo> {
+  const pkg = await readPackageJson(cwd)
+  const techStack: string[] = []
+  let primaryLanguage = 'TypeScript'
+  let description = 'A software project.'
+  let buildCmd: string | undefined
+  let testCmd: string | undefined
+  let lintCmd: string | undefined
+
+  if (pkg) {
+    const deps = {
+      ...(pkg.dependencies as Record<string, string> | undefined),
+      ...(pkg.devDependencies as Record<string, string> | undefined),
+    }
+
+    // Detect frameworks / key dependencies.
+    const frameworks: Array<[string, string]> = [
+      ['react', 'React'],
+      ['next', 'Next.js'],
+      ['vue', 'Vue.js'],
+      ['express', 'Express'],
+      ['fastify', 'Fastify'],
+      ['ink', 'Ink (terminal UI)'],
+      ['electron', 'Electron'],
+      ['vite', 'Vite'],
+      ['webpack', 'Webpack'],
+      ['esbuild', 'esbuild'],
+    ]
+
+    for (const [dep, label] of frameworks) {
+      if (dep in deps) techStack.push(label)
+    }
+
+    // Detect language.
+    if ('typescript' in deps || 'ts-node' in deps) {
+      primaryLanguage = 'TypeScript'
+      techStack.push('TypeScript')
+    } else if (pkg.type === 'module') {
+      primaryLanguage = 'JavaScript (ESM)'
+    } else {
+      primaryLanguage = 'JavaScript'
+    }
+
+    // Detect test framework.
+    if ('vitest' in deps) techStack.push('Vitest')
+    else if ('jest' in deps) techStack.push('Jest')
+    else if ('mocha' in deps) techStack.push('Mocha')
+
+    // Detect lint tools.
+    if ('eslint' in deps) techStack.push('ESLint')
+    if ('prettier' in deps) techStack.push('Prettier')
+
+    // Extract scripts for build/test/lint.
+    const scripts = pkg.scripts as Record<string, string> | undefined
+    if (scripts) {
+      if (scripts.build) buildCmd = `npm run build`
+      if (scripts.test) testCmd = `npm test`
+      if (scripts.lint) lintCmd = `npm run lint`
+    }
+
+    if (pkg.description) {
+      description = pkg.description as string
+    }
+  } else {
+    // No package.json — check for other project types.
+    try {
+      await access(join(cwd, 'Cargo.toml'))
+      primaryLanguage = 'Rust'
+      techStack.push('Rust', 'Cargo')
+      buildCmd = 'cargo build'
+      testCmd = 'cargo test'
+      description = 'A Rust project.'
+    } catch {
+      try {
+        await access(join(cwd, 'go.mod'))
+        primaryLanguage = 'Go'
+        techStack.push('Go')
+        buildCmd = 'go build ./...'
+        testCmd = 'go test ./...'
+        description = 'A Go project.'
+      } catch {
+        try {
+          await access(join(cwd, 'requirements.txt'))
+          primaryLanguage = 'Python'
+          techStack.push('Python')
+          testCmd = 'pytest'
+          description = 'A Python project.'
+        } catch {
+          // Generic fallback.
+          techStack.push('Unknown')
+        }
+      }
+    }
+  }
+
+  return { description, primaryLanguage, techStack, buildCmd, testCmd, lintCmd }
+}
+
+/** Git metadata for the project. */
+interface GitInfo {
+  defaultBranch: string
+  remote: string
+}
+
+/** Detect git branch and remote URL. Returns null if not a git repo. */
+function detectGitInfo(cwd: string): GitInfo | null {
+  try {
+    const branch = execSync('git rev-parse --abbrev-ref HEAD', {
+      cwd,
+      encoding: 'utf-8',
+      timeout: 3000,
+      windowsHide: true,
+    }).trim()
+
+    let remote = 'none'
+    try {
+      remote = execSync('git remote get-url origin', {
+        cwd,
+        encoding: 'utf-8',
+        timeout: 3000,
+        windowsHide: true,
+      }).trim()
+    } catch {
+      // No remote configured.
+    }
+
+    return { defaultBranch: branch || 'main', remote }
+  } catch {
+    return null
+  }
+}
+
+/** List top-level directory entries (excluding node_modules, .git, dist). */
+async function detectDirectoryStructure(cwd: string): Promise<string[]> {
+  const { readdir } = await import('node:fs/promises')
+
+  const HIDDEN = new Set([
+    'node_modules', '.git', 'dist', '.next', '.nuxt',
+    '__pycache__', '.venv', 'venv', '.cache', 'target',
+    '.cc-agent', '.session-memory',
+  ])
+
+  try {
+    const entries = await readdir(cwd, { withFileTypes: true })
+    const dirs: string[] = []
+    const files: string[] = []
+
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') && entry.name !== '.gitignore' && entry.name !== '.env.example') {
+        continue
+      }
+      if (HIDDEN.has(entry.name)) continue
+
+      if (entry.isDirectory()) {
+        dirs.push(`${entry.name}/`)
+      } else {
+        files.push(entry.name)
+      }
+    }
+
+    // Show directories first, then key files.
+    const result = [...dirs.sort(), ...files.sort().slice(0, 10)]
+    if (files.length > 10) {
+      result.push(`... and ${files.length - 10} more files`)
+    }
+
+    return result
+  } catch {
+    return ['(unable to read directory)']
+  }
 }

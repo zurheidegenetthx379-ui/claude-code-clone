@@ -109,6 +109,8 @@ const HELP_TEXT = `Available commands:
   /clear          Clear conversation and start fresh
   /compact        Compact conversation history to free context space
   /model [name]   Show or switch the active model
+  /init           Create a CLAUDE.md project context file
+  /review         Summarize the current conversation
   /exit           Exit the REPL (also Ctrl+D)
   /tools          List available tools
   /permissions    Show current permission settings
