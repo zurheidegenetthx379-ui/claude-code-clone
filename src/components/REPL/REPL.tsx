@@ -29,6 +29,8 @@ import type {
   ToolResultBlock,
 } from '../../types/index.js'
 import type { ApprovalBridge, PendingApproval } from '../../utils/ApprovalBridge.js'
+import type { CommandContext } from '../../commands.js'
+import { executeCommand } from '../../commands.js'
 import { compactConversation } from '../../services/compact/compact.js'
 import { getEffectiveContextWindowSize } from '../../utils/context.js'
 
@@ -291,39 +293,77 @@ export function REPL(props: REPLProps): React.ReactElement {
   )
 
   // ----------------------------------------------------------
-  // Slash command handler
+  // Slash command handler — delegates to commands.ts registry
   // ----------------------------------------------------------
 
   const handleSlashCommand = useCallback(
-    (input: string): boolean => {
-      const [command, ...rest] = input.slice(1).split(/\s+/)
-      const args = rest.join(' ')
+    async (input: string): Promise<boolean> => {
+      const trimmed = input.trim()
 
-      switch (command) {
-        case 'help':
-          setShowHelp(prev => !prev)
-          return true
+      // Build CommandContext from engine + store state.
+      const engineState = queryEngine.getState()
+      const appState = store.getState()
 
-        case 'clear':
-          queryEngine.reset()
-          store.clearMessages()
-          setDisplayEntries([])
-          setError(null)
-          addEntry({ role: 'system', content: 'Conversation cleared.' })
-          return true
+      const commandContext: CommandContext = {
+        queryEngine,
+        appState: {
+          ...appState,
+          messages: engineState.messages,
+          input: '',
+          isLoading: engineState.status === 'running',
+        },
+        tools,
+        cwd: appState.cwd,
+        sessionId: appState.sessionId,
+        model: engineState.model,
+        memoryEnabled: false,
+        setModel: (newModel: string) => {
+          setCurrentModel(newModel)
+        },
+        sessionTokenUsage: engineState.totalTokens,
+        sessionCostUsd: engineState.estimatedCostUsd,
+      }
 
-        case 'compact': {
-          const state = queryEngine.getState()
-          if (state.messages.length === 0) {
-            addEntry({ role: 'system', content: 'No messages to compact.' })
-            return true
-          }
-          addEntry({ role: 'system', content: 'Compacting conversation history...' })
+      // Dispatch through the unified command registry.
+      const result = await executeCommand(trimmed, commandContext)
+
+      // ── Handle special UI side effects ──────────────────────
+
+      // Exit signal.
+      if (result.exit) {
+        if (result.text) addEntry({ role: 'system', content: result.text })
+        exit()
+        return true
+      }
+
+      // Clear messages signal (/clear).
+      if (result.clearMessages) {
+        queryEngine.reset()
+        store.clearMessages()
+        setDisplayEntries([])
+        setError(null)
+      }
+
+      // Show text output.
+      if (result.text) {
+        addEntry({ role: 'system', content: result.text })
+      }
+
+      // Show error output.
+      if (result.error) {
+        addEntry({ role: 'error', content: result.error, isError: true })
+      }
+
+      // ── Special post-processing for /compact ──────────────
+      const commandName = trimmed.replace(/^\/+/, '').split(/\s+/)[0]!.toLowerCase()
+
+      if (commandName === 'compact' && !result.error) {
+        const state = queryEngine.getState()
+        if (state.messages.length >= 4) {
+          const effectiveWindow = getEffectiveContextWindowSize(state.model)
+          const targetTokens = Math.floor(effectiveWindow * 0.5)
           try {
-            const model = state.model || 'claude-sonnet-4-20250514'
-            const effectiveWindow = getEffectiveContextWindowSize(model)
-            const targetTokens = Math.floor(effectiveWindow * 0.5)
-            const { result, keptMessages } = compactConversation(
+            const { result: compactResult, keptMessages } = compactConversation(
               state.messages,
               { targetTokens },
             )
@@ -333,8 +373,8 @@ export function REPL(props: REPLProps): React.ReactElement {
             setDisplayEntries([])
             addEntry({
               role: 'system',
-              content: `Compacted: removed ${result.messagesRemoved}, kept ${result.messagesKept}. ` +
-                `Tokens: ${result.tokenCountBefore} → ${result.tokenCountAfter}`,
+              content: `Compacted: removed ${compactResult.messagesRemoved}, kept ${compactResult.messagesKept}. ` +
+                `Tokens: ${compactResult.tokenCountBefore} → ${compactResult.tokenCountAfter}`,
             })
           } catch (err) {
             addEntry({
@@ -343,74 +383,18 @@ export function REPL(props: REPLProps): React.ReactElement {
               isError: true,
             })
           }
-          return true
         }
-
-        case 'model':
-          if (args) {
-            setCurrentModel(args)
-            addEntry({
-              role: 'system',
-              content: `Model switched to: ${args}`,
-            })
-          } else {
-            addEntry({
-              role: 'system',
-              content: `Current model: ${currentModel}`,
-            })
-          }
-          return true
-
-        case 'exit':
-        case 'quit':
-        case 'q':
-          exit()
-          return true
-
-        case 'tools': {
-          const lines = tools.map(t => {
-            const desc =
-              typeof t.description === 'function'
-                ? t.description()
-                : t.description
-            return `  - ${t.name}: ${desc.slice(0, 80)}`
-          })
-          addEntry({
-            role: 'system',
-            content: `Available tools (${tools.length}):\n${lines.join('\n')}`,
-          })
-          return true
-        }
-
-        case 'permissions':
-          addEntry({
-            role: 'system',
-            content: `Permission mode: ${store.getState().permissionContext.permissionMode}`,
-          })
-          return true
-
-        case 'abort':
-          if (queryEngine.getState().status === 'running') {
-            queryEngine.abort()
-            addEntry({ role: 'system', content: 'Query aborted.' })
-          } else {
-            addEntry({
-              role: 'system',
-              content: 'No query in progress.',
-            })
-          }
-          return true
-
-        default:
-          addEntry({
-            role: 'error',
-            content: `Unknown command: /${command}. Type /help for available commands.`,
-            isError: true,
-          })
-          return true
       }
+
+      // ── Special post-processing for /help ─────────────────
+      // Toggle the help overlay in addition to showing the command output.
+      if (commandName === 'help' || commandName === '?') {
+        setShowHelp(false) // Command output already shows help text
+      }
+
+      return true
     },
-    [queryEngine, store, tools, currentModel, exit, addEntry],
+    [queryEngine, store, tools, exit, addEntry],
   )
 
   // ----------------------------------------------------------
@@ -425,7 +409,7 @@ export function REPL(props: REPLProps): React.ReactElement {
       setInputValue('')
 
       if (trimmed.startsWith('/')) {
-        handleSlashCommand(trimmed)
+        void handleSlashCommand(trimmed)
       } else {
         // Fire-and-forget; the async function manages its own state.
         void executeQuery(trimmed)

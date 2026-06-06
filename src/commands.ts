@@ -507,6 +507,23 @@ export const BUILT_IN_COMMANDS: ReadonlyArray<Command> = [
       return exitCommand.execute(args, context)
     },
   },
+
+  // ── /abort ────────────────────────────────────────────────────────────
+  {
+    name: 'abort',
+    description: 'Cancel the currently running query.',
+    isEnabled: true,
+    isHidden: false,
+
+    async execute(_args: string, context: CommandContext): Promise<CommandResult> {
+      const state = context.queryEngine.getState()
+      if (state.status === 'running') {
+        context.queryEngine.abort()
+        return { text: 'Query aborted.' }
+      }
+      return { text: 'No query in progress.' }
+    },
+  },
 ]
 
 // ============================================================
