@@ -641,6 +641,7 @@
   let toolCards = {};              // id -> { card, body, statusEl }
   let thinkingBlock = null;        // current thinking block element
   let thinkingText = '';
+  let fileTreeInitialized = false; // track whether root file tree has been loaded
 
   /* ── DOM refs ────────────────────────────────────────── */
   const $ = (s) => document.querySelector(s);
@@ -664,12 +665,6 @@
   marked.setOptions({
     breaks: true,
     gfm: true,
-    highlight: (code, lang) => {
-      if (lang && hljs.getLanguage(lang)) {
-        try { return hljs.highlight(code, { language: lang }).value; } catch (_) { /* fall */ }
-      }
-      return hljs.highlightAuto(code).value;
-    },
   });
 
   /* ── WebSocket ───────────────────────────────────────── */
@@ -1015,22 +1010,26 @@
   /* ── File tree ───────────────────────────────────────── */
   function renderFileTree(entries, basePath) {
     if (!entries) return;
-    // If it's root level, clear tree
-    if (!basePath || basePath === '.') {
-      fileTree.innerHTML = '';
-    }
 
-    const container = basePath && basePath !== '.'
-      ? fileTree.querySelector(`[data-path="${CSS.escape(basePath)}"] .children`)
-      : fileTree;
+    let container;
+    if (!fileTreeInitialized) {
+      // First (root) load — clear and render into root container
+      fileTree.innerHTML = '';
+      container = fileTree;
+      fileTreeInitialized = true;
+    } else {
+      // Subdirectory load — find the matching directory's .children container
+      container = fileTree.querySelector(`[data-path="${CSS.escape(basePath)}"] > .children`);
+    }
     if (!container) return;
 
     entries.forEach((entry) => {
       const item = document.createElement('div');
+      const entryPath = entry.fullPath || entry.name;
 
       if (entry.type === 'directory') {
         item.className = 'file-item dir';
-        item.dataset.path = entry.path || entry.name;
+        item.dataset.path = entryPath;
         item.innerHTML = `
           <span class="chevron">&#x25B6;</span>
           <span class="icon">&#x1F4C1;</span>
@@ -1049,7 +1048,7 @@
             item.classList.add('open');
             // lazy load if children empty
             if (children.children.length === 0) {
-              send({ type: 'file:tree', path: entry.path || entry.name });
+              send({ type: 'file:tree', path: entryPath });
             }
           }
         });
@@ -1061,7 +1060,7 @@
         `;
         item.addEventListener('click', (e) => {
           e.stopPropagation();
-          send({ type: 'file:read', path: entry.path || entry.name });
+          send({ type: 'file:read', path: entryPath });
         });
       }
 
@@ -1158,6 +1157,9 @@
     thinkingText = '';
     toolCards = {};
     tokenSummary.classList.remove('visible');
+    fileTreeInitialized = false;
+    send({ type: 'sessions:list' });
+    send({ type: 'file:tree' });
   });
 
   $('#refresh-sessions').addEventListener('click', () => {

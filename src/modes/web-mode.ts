@@ -136,7 +136,7 @@ interface WsAgentErrorMessage {
 interface WsFileTreeMessage {
   type: 'file:tree'
   path: string
-  entries: Array<{ name: string; type: 'file' | 'directory'; size: number }>
+  entries: Array<{ name: string; fullPath: string; type: 'file' | 'directory'; size: number }>
 }
 
 interface WsFileContentMessage {
@@ -225,18 +225,28 @@ export async function startWebServer(options: WebOptions): Promise<void> {
   const port = options.port ?? DEFAULT_PORT
 
   // ---- Assemble shared runtime ----
-  const runtime: AssembledRuntime = await assembleRuntime({
-    model: options.model ?? DEFAULT_MODEL,
-    systemPrompt: options.systemPrompt,
-    appendSystemPrompt: options.appendSystemPrompt,
-    permissionMode: options.permissionMode ?? 'default',
-    maxTokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
-    temperature: options.temperature,
-    cwd: options.cwd,
-    mcpConfigs: [],
-    allowList: options.allowList,
-    denyList: options.denyList,
-  })
+  let runtime: AssembledRuntime
+  try {
+    runtime = await assembleRuntime({
+      model: options.model ?? DEFAULT_MODEL,
+      systemPrompt: options.systemPrompt,
+      appendSystemPrompt: options.appendSystemPrompt,
+      permissionMode: options.permissionMode ?? 'default',
+      maxTokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
+      temperature: options.temperature,
+      cwd: options.cwd,
+      mcpConfigs: [],
+      allowList: options.allowList,
+      denyList: options.denyList,
+    })
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error(`[web] Failed to initialize runtime: ${msg}`)
+    console.error(
+      '[web] Make sure ANTHROPIC_API_KEY (or equivalent) is set in your environment or .env file.',
+    )
+    process.exit(1)
+  }
 
   // ---- Express app ----
   const app = express()
@@ -262,6 +272,12 @@ export async function startWebServer(options: WebOptions): Promise<void> {
 
   wss.on('connection', (ws: WebSocket) => {
     openConnections.add(ws)
+
+    // Send a welcome message so the client knows the server is alive.
+    ws.send(JSON.stringify({
+      type: 'agent:text',
+      content: 'CC Agent is ready. Send a message to start.',
+    } satisfies WsAgentTextMessage))
 
     // Per-connection engine state (created lazily on first message).
     let engine: QueryEngine | null = null
@@ -577,6 +593,7 @@ async function handleFileTree(
       })
       .map((entry) => ({
         name: entry.name,
+        fullPath: path.join(targetDir, entry.name),
         type: (entry.isDirectory() ? 'directory' : 'file') as 'file' | 'directory',
         size: entry.isDirectory() ? 0 : 0, // Dirent does not carry size; set to 0.
       }))
