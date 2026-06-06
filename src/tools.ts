@@ -9,6 +9,7 @@
  * - Permission filtering is applied via getTools() before sending to the model
  */
 
+import minimatch from 'minimatch'
 import type {
   ToolInstance,
   PermissionContext,
@@ -277,7 +278,14 @@ function mcpToolDefToToolInstance(mcpToolDef: McpToolDefinition): ToolInstance {
     isReadOnly: () => false,
     isDestructive: () => false,
 
-    async checkPermissions(_input, _context) {
+    async checkPermissions(input, context) {
+      // MCP tools must respect the deny list to prevent unrestricted access.
+      if (context) {
+        const toolName = mcpToolDef.name
+        if (context.denyList.some((p) => toolName.includes(p) || minimatch(toolName, p))) {
+          return { behavior: 'deny' as const, message: `MCP tool "${toolName}" matches deny-list entry.` }
+        }
+      }
       return { behavior: 'allow' as const }
     },
 

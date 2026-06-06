@@ -1,5 +1,6 @@
 import { resolve, relative, normalize } from 'node:path'
 import { realpath } from 'node:fs/promises'
+import { realpathSync } from 'node:fs'
 
 /** Directories and files that are always off-limits. */
 const PROTECTED_PATHS = [
@@ -100,14 +101,23 @@ export async function checkPathAccess(
 
 /**
  * Synchronous version for use in checkPermissions (which may not be async in all tools).
- * Uses path.resolve without realpath — less precise but faster.
+ * Uses realpathSync to resolve symlinks, falling back to path.resolve if the file doesn't exist.
  */
 export function checkPathAccessSync(
   inputPath: string,
   options: PathPolicyOptions,
 ): PathCheckResult {
   const cwd = normalize(options.cwd)
-  const resolved = resolve(cwd, inputPath)
+  const raw = resolve(cwd, inputPath)
+
+  // Resolve symlinks to prevent symlink-based cwd escape.
+  let resolved: string
+  try {
+    resolved = realpathSync(raw)
+  } catch {
+    // File may not exist yet (e.g., write targets) — use unresolved path.
+    resolved = raw
+  }
 
   const relPath = relative(cwd, resolved)
   for (const protected_ of PROTECTED_PATHS) {

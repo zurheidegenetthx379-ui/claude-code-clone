@@ -10,6 +10,7 @@
 import { readFile, stat } from 'node:fs/promises'
 import { resolve, isAbsolute } from 'node:path'
 import { extname } from 'node:path'
+import minimatch from 'minimatch'
 import { buildTool } from '../../Tool.js'
 import { checkPathAccessSync } from '../../utils/PathPolicy.js'
 import type {
@@ -136,7 +137,7 @@ const FileReadTool = buildTool({
     if (!context) return { behavior: 'allow' }
     const filePath = typeof input.file_path === 'string' ? input.file_path : ''
 
-    if (context.denyList.some((p) => filePath.includes(p))) {
+    if (context.denyList.some((p) => minimatch(filePath, p, { dot: true }) || filePath.includes(p))) {
       return { behavior: 'deny', message: 'File path matches deny-list entry.' }
     }
 

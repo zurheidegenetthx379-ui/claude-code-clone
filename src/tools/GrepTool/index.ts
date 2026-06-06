@@ -14,6 +14,7 @@ import minimatch from 'minimatch'
 import { readFileSync, statSync, readdirSync } from 'node:fs'
 import { resolve, isAbsolute, join, extname, relative } from 'node:path'
 import { buildTool } from '../../Tool.js'
+import { checkPathAccessSync } from '../../utils/PathPolicy.js'
 import type {
   ToolResult,
   ToolUseContext,
@@ -223,11 +224,21 @@ const GrepTool = buildTool({
     context?: PermissionContext,
   ): Promise<PermissionResult> {
     if (!context) return { behavior: 'allow' }
-    const searchPath = typeof input.path === 'string' ? input.path : ''
+    const searchPath = typeof input.path === 'string' ? input.path : '.'
 
     if (context.denyList.some((p) => searchPath.includes(p))) {
       return { behavior: 'deny', message: 'Search path matches deny-list entry.' }
     }
+
+    // Enforce path boundaries (protected paths, cwd containment).
+    const pathCheck = checkPathAccessSync(searchPath, {
+      cwd: context.cwd,
+      allowOutsideCwd: context.permissionMode === 'bypassPermissions',
+    })
+    if (!pathCheck.allowed) {
+      return { behavior: 'deny', message: pathCheck.reason }
+    }
+
     return { behavior: 'allow' }
   },
 
