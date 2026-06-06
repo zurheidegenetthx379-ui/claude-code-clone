@@ -33,6 +33,7 @@ import type { CommandContext } from '../../commands.js'
 import { executeCommand } from '../../commands.js'
 import { MarkdownText } from '../MarkdownText.js'
 import { compactConversation } from '../../services/compact/compact.js'
+import { generateCompactSummary } from '../../services/compact/aiSummary.js'
 import { getEffectiveContextWindowSize } from '../../utils/context.js'
 
 // ============================================================
@@ -386,18 +387,41 @@ export function REPL(props: REPLProps): React.ReactElement {
           const effectiveWindow = getEffectiveContextWindowSize(state.model)
           const targetTokens = Math.floor(effectiveWindow * 0.5)
           try {
+            // Generate AI summary of messages that will be dropped.
+            addEntry({ role: 'system', content: 'Generating conversation summary...' })
+
+            const messagesToDrop = state.messages.slice(
+              0,
+              state.messages.length - Math.max(1, Math.floor(state.messages.length * 0.3)),
+            )
+
+            let aiSummary: string | null = null
+            try {
+              aiSummary = await generateCompactSummary(
+                queryEngine.getProvider(),
+                messagesToDrop,
+              )
+            } catch {
+              // Fall back to heuristic summary if AI generation fails.
+            }
+
             const { result: compactResult, keptMessages } = compactConversation(
               state.messages,
-              { targetTokens },
+              {
+                targetTokens,
+                summary: aiSummary ?? undefined,
+              },
             )
             queryEngine.reset()
             queryEngine.loadHistory(keptMessages)
             store.clearMessages()
             setDisplayEntries([])
+
+            const summaryNote = aiSummary ? ' (AI-generated summary)' : ' (heuristic summary)'
             addEntry({
               role: 'system',
               content: `Compacted: removed ${compactResult.messagesRemoved}, kept ${compactResult.messagesKept}. ` +
-                `Tokens: ${compactResult.tokenCountBefore} → ${compactResult.tokenCountAfter}`,
+                `Tokens: ${compactResult.tokenCountBefore} → ${compactResult.tokenCountAfter}${summaryNote}`,
             })
           } catch (err) {
             addEntry({

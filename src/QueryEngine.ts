@@ -370,6 +370,11 @@ export class QueryEngine {
     return this.apiClient.getUsage()
   }
 
+  /** Access the underlying provider adapter (e.g. for AI compact summaries). */
+  getProvider(): ProviderAdapter {
+    return this.apiClient
+  }
+
   /** Reset the engine to its initial state, clearing the transcript. */
   reset(): void {
     this.abort()
