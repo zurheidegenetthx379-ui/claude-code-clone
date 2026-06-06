@@ -34,6 +34,7 @@ import {
   appendFile,
   mkdir,
   open,
+  readdir,
   readFile,
   stat,
   unlink,
@@ -1318,6 +1319,66 @@ export async function readLiteMetadata(filePath: string): Promise<LiteSessionMet
       await fileHandle.close()
     }
   }
+}
+
+// ============================================================
+// Session Discovery — List Saved Sessions
+// ============================================================
+
+/**
+ * Returns the absolute path to the sessions directory for a project.
+ *
+ * ```
+ * <projectDir>/.cc-agent/sessions/
+ * ```
+ */
+export function getSessionsDir(projectDir: string): string {
+  return join(resolve(projectDir), '.cc-agent', 'sessions')
+}
+
+/**
+ * Scan the sessions directory and return a list of saved session IDs,
+ * sorted by last-modified time (newest first).
+ *
+ * Only main-chain `.jsonl` files are included (sidechain `-agent-*` files
+ * are excluded).  Returns an empty array when the directory does not exist
+ * or contains no sessions.
+ *
+ * @param projectDir — root directory of the project.
+ */
+export async function listSavedSessions(projectDir: string): Promise<string[]> {
+  const sessionsDir = getSessionsDir(projectDir)
+
+  let entries: string[]
+  try {
+    entries = await readdir(sessionsDir)
+  } catch {
+    return []
+  }
+
+  // Collect main-chain .jsonl files with their mtime for sorting.
+  const sessions: { id: string; mtime: number }[] = []
+
+  for (const entry of entries) {
+    // Skip sidechain files and non-jsonl files.
+    if (!entry.endsWith('.jsonl')) continue
+    if (entry.includes('-agent-')) continue
+
+    const filePath = join(sessionsDir, entry)
+    try {
+      const fileStat = await stat(filePath)
+      if (!fileStat.isFile()) continue
+
+      const sessionId = entry.replace(/\.jsonl$/, '')
+      sessions.push({ id: sessionId, mtime: fileStat.mtimeMs })
+    } catch {
+      // Skip files we can't stat.
+    }
+  }
+
+  // Sort newest-first by modification time.
+  sessions.sort((a, b) => b.mtime - a.mtime)
+  return sessions.map((s) => s.id)
 }
 
 // ============================================================

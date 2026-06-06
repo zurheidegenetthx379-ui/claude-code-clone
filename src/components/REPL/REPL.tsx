@@ -35,6 +35,8 @@ import { MarkdownText } from '../MarkdownText.js'
 import { compactConversation } from '../../services/compact/compact.js'
 import { generateCompactSummary } from '../../services/compact/aiSummary.js'
 import { getEffectiveContextWindowSize } from '../../utils/context.js'
+import * as sessionStorage from '../../utils/sessionStorage.js'
+import type { TranscriptEntry } from '../../utils/sessionStorage.js'
 
 // ============================================================
 // Props
@@ -208,9 +210,23 @@ export function REPL(props: REPLProps): React.ReactElement {
       // Record user message in display.
       addEntry({ role: 'user', content: prompt })
 
+      // Persist user message to session storage (best-effort).
+      const appState = store.getState()
+      const userMsgId = crypto.randomUUID?.() ?? Math.random().toString(36).slice(2)
+      try {
+        sessionStorage.appendEntry({
+          type: 'user',
+          uuid: userMsgId,
+          sessionId: appState.sessionId,
+          timestamp: Date.now(),
+          content: prompt,
+        } as TranscriptEntry, appState.cwd)
+      } catch { /* persistence is best-effort */ }
+
       // Reset streaming state for this query.
       streamBufferRef.current = ''
       setStreamingText('')
+      let fullResponseText = ''
 
       // Throttled streaming text flush (~30fps).
       streamTimerRef.current = setInterval(() => {
@@ -223,6 +239,7 @@ export function REPL(props: REPLProps): React.ReactElement {
       // Wire up event listeners for this query cycle.
       const onText = (chunk: string) => {
         streamBufferRef.current += chunk
+        fullResponseText += chunk
       }
 
       const onToolUse = (toolUse: ToolUseBlock) => {
@@ -263,6 +280,20 @@ export function REPL(props: REPLProps): React.ReactElement {
 
         // Finalize any remaining streaming text.
         commitStreamingText()
+
+        // Persist assistant response to session storage (best-effort).
+        if (fullResponseText) {
+          try {
+            sessionStorage.appendEntry({
+              type: 'assistant',
+              uuid: crypto.randomUUID?.() ?? Math.random().toString(36).slice(2),
+              sessionId: appState.sessionId,
+              timestamp: Date.now(),
+              content: fullResponseText,
+              parentUuid: userMsgId,
+            } as TranscriptEntry, appState.cwd)
+          } catch { /* best-effort */ }
+        }
 
         // Stop-reason annotation if non-standard.
         if (result.stopReason && result.stopReason !== 'end_turn') {
@@ -327,6 +358,7 @@ export function REPL(props: REPLProps): React.ReactElement {
       // Build CommandContext from engine + store state.
       const engineState = queryEngine.getState()
       const appState = store.getState()
+      const savedSessions = await sessionStorage.listSavedSessions(appState.cwd).catch(() => [])
 
       const commandContext: CommandContext = {
         queryEngine,
@@ -341,6 +373,7 @@ export function REPL(props: REPLProps): React.ReactElement {
         sessionId: appState.sessionId,
         model: engineState.model,
         memoryEnabled: false,
+        savedSessions,
         setModel: (newModel: string) => {
           setCurrentModel(newModel)
         },

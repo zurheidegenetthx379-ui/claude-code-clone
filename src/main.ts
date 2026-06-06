@@ -881,6 +881,7 @@ export async function handleCommand(
   runtime: AssembledRuntime,
 ): Promise<HandleCommandResult> {
   // Build the CommandContext expected by the command registry.
+  const savedSessions = await sessionStorage.listSavedSessions(runtime.cwd).catch(() => [])
   const commandContext: CommandContext = {
     queryEngine: engine,
     appState: {
@@ -902,6 +903,7 @@ export async function handleCommand(
     sessionId: runtime.sessionId,
     model: runtime.model,
     memoryEnabled: runtime.enableMemory,
+    savedSessions,
     setModel: (newModel: string) => {
       (runtime as { model: string }).model = newModel
     },
