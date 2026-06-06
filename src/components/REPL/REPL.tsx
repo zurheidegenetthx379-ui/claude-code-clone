@@ -28,6 +28,7 @@ import type {
   ToolUseBlock,
   ToolResultBlock,
 } from '../../types/index.js'
+import type { ApprovalBridge, PendingApproval } from '../../utils/ApprovalBridge.js'
 import { compactConversation } from '../../services/compact/compact.js'
 import { getEffectiveContextWindowSize } from '../../utils/context.js'
 
@@ -46,6 +47,8 @@ export interface REPLProps {
   store: AppStateStore
   /** Optional initial prompt to execute on mount. */
   initialPrompt?: string
+  /** Approval bridge for interactive tool confirmation. */
+  approvalBridge?: ApprovalBridge
 }
 
 // ============================================================
@@ -118,7 +121,7 @@ Keyboard shortcuts:
 // ============================================================
 
 export function REPL(props: REPLProps): React.ReactElement {
-  const { queryEngine, tools, systemPrompt: _systemPrompt, store, initialPrompt } = props
+  const { queryEngine, tools, systemPrompt: _systemPrompt, store, initialPrompt, approvalBridge } = props
   const { exit } = useApp()
 
   // ----------------------------------------------------------
@@ -130,6 +133,7 @@ export function REPL(props: REPLProps): React.ReactElement {
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [showHelp, setShowHelp] = useState(false)
+  const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null)
   const [currentModel, setCurrentModel] = useState(
     () => queryEngine.getState().model,
   )
@@ -435,6 +439,21 @@ export function REPL(props: REPLProps): React.ReactElement {
   // ----------------------------------------------------------
 
   useInput((inputChar, key) => {
+    // When an approval dialog is shown, capture y/n and ignore everything else.
+    if (pendingApproval && approvalBridge) {
+      if (inputChar.toLowerCase() === 'y') {
+        approvalBridge.respond(true)
+        addEntry({ role: 'system', content: `Approved: ${pendingApproval.toolName}` })
+        return
+      }
+      if (inputChar.toLowerCase() === 'n' || (key.ctrl && inputChar.toLowerCase() === 'c')) {
+        approvalBridge.respond(false)
+        addEntry({ role: 'system', content: `Denied: ${pendingApproval.toolName}` })
+        return
+      }
+      return // Ignore all other keys during approval
+    }
+
     // Ctrl+C: abort current query, or exit if idle.
     if (key.ctrl && inputChar.toLowerCase() === 'c') {
       if (queryEngine.getState().status === 'running') {
@@ -486,6 +505,28 @@ export function REPL(props: REPLProps): React.ReactElement {
       queryEngine.off('state', onState)
     }
   }, [queryEngine])
+
+  // ----------------------------------------------------------
+  // Approval bridge — show confirmation dialog for tool approvals
+  // ----------------------------------------------------------
+
+  useEffect(() => {
+    if (!approvalBridge) return
+
+    const onRequest = (info: PendingApproval) => {
+      setPendingApproval(info)
+    }
+    const onResponded = () => {
+      setPendingApproval(null)
+    }
+
+    approvalBridge.on('request', onRequest)
+    approvalBridge.on('responded', onResponded)
+    return () => {
+      approvalBridge.off('request', onRequest)
+      approvalBridge.off('responded', onResponded)
+    }
+  }, [approvalBridge])
 
   // ----------------------------------------------------------
   // Render: individual display entry
@@ -590,7 +631,7 @@ export function REPL(props: REPLProps): React.ReactElement {
         )}
 
         {/* Loading indicator */}
-        {isLoading && (
+        {isLoading && !pendingApproval && (
           <Box marginBottom={1}>
             <Text color="yellow">
               <Spinner type="dots" />
@@ -598,18 +639,47 @@ export function REPL(props: REPLProps): React.ReactElement {
             <Text color="yellow"> Thinking...</Text>
           </Box>
         )}
+
+        {/* Approval dialog */}
+        {pendingApproval && (
+          <Box
+            flexDirection="column"
+            borderStyle="round"
+            borderColor="yellow"
+            paddingX={1}
+            paddingY={1}
+            marginBottom={1}
+          >
+            <Text color="yellow" bold>
+              Approval Required: {pendingApproval.toolName}
+            </Text>
+            <Text color="gray">
+              {JSON.stringify(pendingApproval.input).slice(0, 300)}
+            </Text>
+            <Box marginTop={1}>
+              <Text color="green" bold>[Y]</Text>
+              <Text color="gray"> Approve  </Text>
+              <Text color="red" bold>[N]</Text>
+              <Text color="gray"> Deny</Text>
+            </Box>
+          </Box>
+        )}
       </Box>
 
       {/* Input area */}
-      <Box borderStyle="single" borderColor={isLoading ? 'yellow' : 'green'} paddingX={1}>
-        <Text color={isLoading ? 'yellow' : 'green'} bold>
-          {isLoading ? '  ' : '> '}
+      <Box borderStyle="single" borderColor={pendingApproval ? 'yellow' : isLoading ? 'yellow' : 'green'} paddingX={1}>
+        <Text color={pendingApproval ? 'yellow' : isLoading ? 'yellow' : 'green'} bold>
+          {pendingApproval ? '  ' : isLoading ? '  ' : '> '}
         </Text>
         <TextInput
           value={inputValue}
           onChange={setInputValue}
           onSubmit={onSubmit}
-          placeholder={isLoading ? 'Processing...' : 'Type a message or /help'}
+          placeholder={
+            pendingApproval ? 'Press Y to approve or N to deny'
+            : isLoading ? 'Processing...'
+            : 'Type a message or /help'
+          }
         />
       </Box>
 

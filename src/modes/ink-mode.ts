@@ -30,6 +30,7 @@ import {
 import { runHooks } from '../services/hooks/hookRunner.js'
 
 import { launchRepl } from '../replLauncher.js'
+import { ApprovalBridge } from '../utils/ApprovalBridge.js'
 
 /**
  * Start the interactive REPL using the React+Ink terminal UI.
@@ -65,15 +66,12 @@ export async function startInkRepl(options: ReplOptions): Promise<void> {
   // Create the query engine in fully-silent mode — the Ink component handles
   // its own display via engine events, so we suppress ALL console output
   // to avoid corrupting the Ink render.
+  const approvalBridge = new ApprovalBridge()
+
   const engine = createQueryEngine(runtime, {
     fullySilent: true,
     isInteractive: true,
-    approvalCallback: async (toolName: string, _input: Record<string, unknown>) => {
-      // TODO: Wire to Ink UI confirmation dialog
-      // For now, deny to maintain fail-closed security
-      console.error(`[ink] Tool "${toolName}" requires approval — auto-denied (Ink UI approval not yet implemented)`)
-      return false
-    },
+    approvalCallback: approvalBridge.callback,
   })
 
   // ---- Session memory initialization (Ink mode) ----
@@ -106,6 +104,7 @@ export async function startInkRepl(options: ReplOptions): Promise<void> {
     sessionId: runtime.sessionId,
     permissionContext: runtime.permissionContext,
     initialPrompt: options.initialPrompt,
+    approvalBridge,
   })
 
   // ---- Cleanup ----

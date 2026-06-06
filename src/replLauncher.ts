@@ -36,6 +36,7 @@ import { REPL } from './components/REPL/REPL.js'
 import { createAppStateStore } from './state/AppStateStore.js'
 import type { AppStateStore } from './state/AppStateStore.js'
 import type { QueryEngine } from './QueryEngine.js'
+import type { ApprovalBridge } from './utils/ApprovalBridge.js'
 import type {
   Message,
   PermissionContext,
@@ -81,6 +82,8 @@ export interface LaunchReplOptions {
   restoredMessages?: Message[]
   /** Optional current agent identity. */
   currentAgent?: AgentIdentity
+  /** Approval bridge for interactive tool confirmation (Ink TUI). */
+  approvalBridge?: ApprovalBridge
 }
 
 // ============================================================
@@ -170,6 +173,7 @@ export async function launchRepl(options: LaunchReplOptions): Promise<number> {
       systemPrompt: options.systemPrompt,
       store,
       initialPrompt: options.initialPrompt,
+      approvalBridge: options.approvalBridge,
     }),
     {
       // Ink v5 automatically patches process.stdout/stderr; we still
