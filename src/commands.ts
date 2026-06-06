@@ -732,6 +732,152 @@ export const BUILT_IN_COMMANDS: ReadonlyArray<Command> = [
       return { text: lines.join('\n') }
     },
   },
+
+  // ── /doctor ───────────────────────────────────────────────────────────
+  {
+    name: 'doctor',
+    description: 'Run environment diagnostics: API keys, connectivity, tools, git.',
+    isEnabled: true,
+    isHidden: false,
+
+    async execute(_args: string, context: CommandContext): Promise<CommandResult> {
+      const lines: string[] = ['## Environment Diagnostics', '']
+      const checks: Array<{ label: string; ok: boolean; detail: string }> = []
+
+      // ── 1. Runtime ──────────────────────────────────────────────────
+      checks.push({
+        label: 'Node.js',
+        ok: true,
+        detail: `v${process.version} (${process.platform} ${process.arch})`,
+      })
+
+      checks.push({
+        label: 'Working directory',
+        ok: true,
+        detail: context.cwd,
+      })
+
+      // ── 2. API keys ─────────────────────────────────────────────────
+      const antKey = process.env['ANTHROPIC_API_KEY']
+      checks.push({
+        label: 'ANTHROPIC_API_KEY',
+        ok: !!antKey,
+        detail: antKey ? `${antKey.slice(0, 10)}...${antKey.slice(-4)}` : 'not set',
+      })
+
+      const oaiKey = process.env['OPENAI_API_KEY']
+      checks.push({
+        label: 'OPENAI_API_KEY',
+        ok: !!oaiKey,
+        detail: oaiKey ? `${oaiKey.slice(0, 7)}...${oaiKey.slice(-4)}` : 'not set',
+      })
+
+      const baseUrl = process.env['ANTHROPIC_BASE_URL'] ?? process.env['OPENAI_BASE_URL']
+      if (baseUrl) {
+        checks.push({
+          label: 'API Base URL',
+          ok: true,
+          detail: baseUrl,
+        })
+      }
+
+      // ── 3. Model ────────────────────────────────────────────────────
+      checks.push({
+        label: 'Active model',
+        ok: true,
+        detail: context.model,
+      })
+
+      // ── 4. Git ──────────────────────────────────────────────────────
+      try {
+        const branch = execSync('git rev-parse --abbrev-ref HEAD', {
+          cwd: context.cwd,
+          encoding: 'utf-8',
+          timeout: 3000,
+          windowsHide: true,
+        }).trim()
+        checks.push({ label: 'Git', ok: true, detail: `branch: ${branch}` })
+      } catch {
+        checks.push({ label: 'Git', ok: false, detail: 'not a git repository or git not found' })
+      }
+
+      // ── 5. Tools ────────────────────────────────────────────────────
+      const enabledTools = context.tools.filter(t => t.isEnabled())
+      const disabledTools = context.tools.filter(t => !t.isEnabled())
+      checks.push({
+        label: 'Tools',
+        ok: enabledTools.length > 0,
+        detail: `${enabledTools.length} enabled, ${disabledTools.length} disabled`,
+      })
+
+      // ── 6. CLAUDE.md ────────────────────────────────────────────────
+      try {
+        await access(join(context.cwd, 'CLAUDE.md'))
+        checks.push({ label: 'CLAUDE.md', ok: true, detail: 'found' })
+      } catch {
+        checks.push({ label: 'CLAUDE.md', ok: false, detail: 'not found (run /init to create)' })
+      }
+
+      // ── 7. .env file ────────────────────────────────────────────────
+      try {
+        await access(join(context.cwd, '.env'))
+        checks.push({ label: '.env', ok: true, detail: 'found' })
+      } catch {
+        checks.push({ label: '.env', ok: false, detail: 'not found' })
+      }
+
+      // ── 8. Session info ─────────────────────────────────────────────
+      checks.push({
+        label: 'Session',
+        ok: true,
+        detail: `${context.sessionId} (${context.appState.messages.length} messages)`,
+      })
+
+      // ── 9. Permission mode ──────────────────────────────────────────
+      const perm = context.appState.permissionContext
+      checks.push({
+        label: 'Permission mode',
+        ok: true,
+        detail: `${perm.permissionMode} (allow: ${perm.allowList.length}, deny: ${perm.denyList.length})`,
+      })
+
+      // ── 10. API connectivity test ───────────────────────────────────
+      const antBaseUrl = process.env['ANTHROPIC_BASE_URL'] ?? 'https://api.anthropic.com'
+      try {
+        const controller = new AbortController()
+        const timeout = setTimeout(() => controller.abort(), 5000)
+        const res = await fetch(antBaseUrl, { signal: controller.signal })
+        clearTimeout(timeout)
+        checks.push({
+          label: 'API connectivity',
+          ok: res.status < 500,
+          detail: `${antBaseUrl} → HTTP ${res.status}`,
+        })
+      } catch (err) {
+        checks.push({
+          label: 'API connectivity',
+          ok: false,
+          detail: `${antBaseUrl} → ${err instanceof Error ? err.message : 'unreachable'}`,
+        })
+      }
+
+      // ── Format output ───────────────────────────────────────────────
+      const maxLabel = checks.reduce((max, c) => Math.max(max, c.label.length), 0)
+      let passCount = 0
+
+      for (const check of checks) {
+        const icon = check.ok ? 'PASS' : 'FAIL'
+        const padding = ' '.repeat(maxLabel - check.label.length + 2)
+        lines.push(`[${icon}] ${check.label}${padding}${check.detail}`)
+        if (check.ok) passCount++
+      }
+
+      lines.push('')
+      lines.push(`**Result:** ${passCount}/${checks.length} checks passed`)
+
+      return { text: lines.join('\n') }
+    },
+  },
 ]
 
 // ============================================================

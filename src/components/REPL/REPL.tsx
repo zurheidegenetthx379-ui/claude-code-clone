@@ -111,6 +111,7 @@ const HELP_TEXT = `Available commands:
   /model [name]   Show or switch the active model
   /init           Create a CLAUDE.md project context file
   /review         Summarize the current conversation
+  /doctor         Run environment diagnostics
   /exit           Exit the REPL (also Ctrl+D)
   /tools          List available tools
   /permissions    Show current permission settings
