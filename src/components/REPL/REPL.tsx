@@ -139,6 +139,7 @@ export function REPL(props: REPLProps): React.ReactElement {
   const [error, setError] = useState<string | null>(null)
   const [showHelp, setShowHelp] = useState(false)
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null)
+  const [streamingText, setStreamingText] = useState<string | null>(null)
   const [currentModel, setCurrentModel] = useState(
     () => queryEngine.getState().model,
   )
@@ -154,6 +155,10 @@ export function REPL(props: REPLProps): React.ReactElement {
 
   // Track whether we have executed the initial prompt already.
   const initialPromptHandled = useRef(false)
+
+  // Ref for throttled streaming text updates (avoids re-render on every token).
+  const streamBufferRef = useRef('')
+  const streamTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   // ----------------------------------------------------------
   // Helpers
@@ -175,6 +180,20 @@ export function REPL(props: REPLProps): React.ReactElement {
   )
 
   // ----------------------------------------------------------
+  // Streaming helpers
+  // ----------------------------------------------------------
+
+  /** Flush the current streaming text buffer into a finalized display entry. */
+  const commitStreamingText = useCallback(() => {
+    const text = streamBufferRef.current
+    if (text.length > 0) {
+      addEntry({ role: 'assistant', content: text })
+    }
+    streamBufferRef.current = ''
+    setStreamingText(null)
+  }, [addEntry])
+
+  // ----------------------------------------------------------
   // Query execution
   // ----------------------------------------------------------
 
@@ -187,28 +206,32 @@ export function REPL(props: REPLProps): React.ReactElement {
       // Record user message in display.
       addEntry({ role: 'user', content: prompt })
 
-      // Accumulate streamed text in a buffer so we can show a single
-      // "assistant" entry when the response completes.
-      let assistantTextBuffer = ''
-      const toolEntries: Array<{
-        type: 'tool_use' | 'tool_result'
-        entry: Omit<DisplayEntry, 'id' | 'timestamp'>
-      }> = []
+      // Reset streaming state for this query.
+      streamBufferRef.current = ''
+      setStreamingText('')
+
+      // Throttled streaming text flush (~30fps).
+      streamTimerRef.current = setInterval(() => {
+        const buf = streamBufferRef.current
+        if (buf.length > 0) {
+          setStreamingText(buf)
+        }
+      }, 33)
 
       // Wire up event listeners for this query cycle.
       const onText = (chunk: string) => {
-        assistantTextBuffer += chunk
+        streamBufferRef.current += chunk
       }
 
       const onToolUse = (toolUse: ToolUseBlock) => {
+        // Finalize current streaming text before showing tool call.
+        commitStreamingText()
+
         const inputPreview = JSON.stringify(toolUse.input).slice(0, 200)
-        toolEntries.push({
-          type: 'tool_use',
-          entry: {
-            role: 'tool_use',
-            content: `${toolUse.name}(${inputPreview})`,
-            toolName: toolUse.name,
-          },
+        addEntry({
+          role: 'tool_use',
+          content: `${toolUse.name}(${inputPreview})`,
+          toolName: toolUse.name,
         })
       }
 
@@ -217,13 +240,10 @@ export function REPL(props: REPLProps): React.ReactElement {
           typeof result.content === 'string'
             ? result.content.slice(0, 300)
             : '[complex result]'
-        toolEntries.push({
-          type: 'tool_result',
-          entry: {
-            role: 'tool_result',
-            content: preview,
-            isError: result.is_error,
-          },
+        addEntry({
+          role: 'tool_result',
+          content: preview,
+          isError: result.is_error,
         })
       }
 
@@ -239,18 +259,10 @@ export function REPL(props: REPLProps): React.ReactElement {
       try {
         const result: QueryResult = await queryEngine.run(prompt)
 
-        // Flush accumulated entries into the display.
-        // 1. Assistant text (if any).
-        if (assistantTextBuffer.length > 0) {
-          addEntry({ role: 'assistant', content: assistantTextBuffer })
-        }
+        // Finalize any remaining streaming text.
+        commitStreamingText()
 
-        // 2. Interleaved tool calls and results.
-        for (const te of toolEntries) {
-          addEntry(te.entry)
-        }
-
-        // 3. Stop-reason annotation if non-standard.
+        // Stop-reason annotation if non-standard.
         if (result.stopReason && result.stopReason !== 'end_turn') {
           addEntry({
             role: 'system',
@@ -258,7 +270,7 @@ export function REPL(props: REPLProps): React.ReactElement {
           })
         }
 
-        // 4. Error display.
+        // Error display.
         if (result.error) {
           addEntry({
             role: 'error',
@@ -278,10 +290,17 @@ export function REPL(props: REPLProps): React.ReactElement {
           turnsCompleted: engineState.turnsCompleted,
         })
       } catch (err) {
+        commitStreamingText()
         const msg = err instanceof Error ? err.message : String(err)
         setError(msg)
         addEntry({ role: 'error', content: msg, isError: true })
       } finally {
+        // Stop the streaming text flush timer.
+        if (streamTimerRef.current !== null) {
+          clearInterval(streamTimerRef.current)
+          streamTimerRef.current = null
+        }
+
         // Clean up event listeners.
         queryEngine.off('text', onText)
         queryEngine.off('tool:use', onToolUse)
@@ -292,7 +311,7 @@ export function REPL(props: REPLProps): React.ReactElement {
         store.setLoading(false)
       }
     },
-    [queryEngine, store, addEntry],
+    [queryEngine, store, addEntry, commitStreamingText],
   )
 
   // ----------------------------------------------------------
@@ -591,6 +610,20 @@ export function REPL(props: REPLProps): React.ReactElement {
       <Box flexDirection="column" flexGrow={1} overflow="hidden">
         {displayEntries.map(renderEntry)}
 
+        {/* Live streaming assistant text */}
+        {streamingText !== null && streamingText.length > 0 && (
+          <Box flexDirection="column" marginBottom={1}>
+            <Box>
+              <Text bold color="white">
+                Assistant
+              </Text>
+            </Box>
+            <Box paddingLeft={2}>
+              <MarkdownText>{streamingText}</MarkdownText>
+            </Box>
+          </Box>
+        )}
+
         {/* Help overlay */}
         {showHelp && (
           <Box
@@ -629,7 +662,11 @@ export function REPL(props: REPLProps): React.ReactElement {
             <Text color="yellow">
               <Spinner type="dots" />
             </Text>
-            <Text color="yellow"> Thinking...</Text>
+            <Text color="yellow">
+              {streamingText !== null && streamingText.length > 0
+                ? ' Generating...'
+                : ' Thinking...'}
+            </Text>
           </Box>
         )}
 
