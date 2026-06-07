@@ -1,0 +1,1466 @@
+/**
+ * QueryEngine — headless / SDK execution engine
+ *
+ * Orchestrates the full agentic query cycle: sends messages to Claude,
+ * receives streaming responses, executes any tool calls the model requests,
+ * feeds results back, and repeats until the model produces a final answer
+ * or a turn/cost limit is reached.
+ *
+ * Designed for headless operation (no UI dependency) and exposes an
+ * EventEmitter interface so that hosts can observe progress, stream text,
+ * or integrate with higher-level UI frameworks.
+ *
+ * Architecture mirrors Claude Code's QueryEngine.ts:
+ *  - Single-turn `run(prompt)` and multi-turn `runMultiTurn(messages)` entry
+ *    points
+ *  - Cooperative cancellation via `abort()`
+ *  - Per-turn cost and token accounting
+ *  - Concurrent execution of read-only / concurrency-safe tools
+ */
+
+import { EventEmitter } from 'node:events'
+import { randomUUID } from 'node:crypto'
+
+import { createApiClient } from './services/api/claude.js'
+import type { TokenUsage, StreamOptions } from './services/api/claude.js'
+import {
+  estimateTokenCount,
+  compactConversation,
+} from './services/compact/compact.js'
+import { getEffectiveContextWindowSize } from './utils/context.js'
+import type { ProviderAdapter } from './services/api/provider.js'
+import { createProvider } from './services/api/provider.js'
+import type {
+  ContentBlock,
+  HookDefinition,
+  Message,
+  PermissionContext,
+  PermissionResult,
+  ToolInstance,
+  ToolResultBlock,
+  ToolUseBlock,
+  ToolUseContext,
+} from './types/index.js'
+import {
+  executeToolCall,
+  buildPermissionChecker,
+} from './utils/toolExecutor.js'
+import {
+  extractFilePathFromToolInput,
+  verifyFileAfterEdit,
+  formatVerificationNote,
+} from './utils/postEditVerification.js'
+
+// ============================================================
+// Event Types
+// ============================================================
+
+/**
+ * Events emitted by the QueryEngine during execution.
+ *
+ * All events carry structured payloads so that consumers can reconstruct
+ * a UI, persist transcripts, or pipe data into downstream systems.
+ */
+export interface QueryEngineEvents {
+  /** A chunk of assistant text was generated. */
+  text: (content: string) => void
+  /** The model requested a tool invocation. */
+  'tool:use': (toolUse: ToolUseBlock) => void
+  /** A partial tool input JSON fragment was received during streaming. */
+  'tool:input_delta': (data: { toolUseId: string; partialJson: string }) => void
+  /** A tool finished executing. */
+  'tool:result': (toolResult: ToolResultBlock) => void
+  /** The model produced an extended-thinking block. */
+  thinking: (content: string) => void
+  /** A tool requires user approval before execution. */
+  'tool:approval_needed': (info: { toolUseId: string; toolName: string; input: Record<string, unknown> }) => void
+  /** An error occurred during execution. */
+  error: (error: Error) => void
+  /** The query cycle completed (successfully or not). */
+  done: (result: QueryResult) => void
+  /** Engine state transitioned. */
+  state: (state: Readonly<QueryEngineState>) => void
+  /** Token accounting updated after a request. */
+  usage: (usage: TokenUsage) => void
+  /** Context was auto-compacted during the agentic loop. */
+  'context:compact': (info: { messagesRemoved: number; tokensBefore: number; tokensAfter: number }) => void
+}
+
+// ============================================================
+// Configuration & State Types
+// ============================================================
+
+export interface QueryEngineConfig {
+  /** Model identifier (e.g. "claude-sonnet-4-20250514"). */
+  model: string
+  /** System prompt prepended to every request. */
+  systemPrompt: string
+  /** Tool definitions available to the model. */
+  tools: ToolInstance[]
+  /** Permission rules governing tool execution. */
+  permissionContext: PermissionContext
+  /** Working directory for tool execution. */
+  cwd: string
+  /** Unique session identifier. */
+  sessionId: string
+  /**
+   * Pre-configured API client. When provided, `apiKey` and `baseUrl` are
+   * ignored. Accepts any ProviderAdapter implementation (Anthropic, OpenAI,
+   * or custom).
+   */
+  apiClient?: ProviderAdapter
+  /** API key (used only when `apiClient` is not supplied). */
+  apiKey?: string
+  /** Base URL override (used only when `apiClient` is not supplied). */
+  baseUrl?: string
+  /** Maximum output tokens per model response (default: 8192). */
+  maxTokens?: number
+  /**
+   * Maximum agentic turns before the engine stops automatically
+   * (default: 50). A "turn" is one model response plus the ensuing tool
+   * execution batch.
+   */
+  maxTurns?: number
+  /** Sampling temperature (0-1). */
+  temperature?: number
+  /**
+   * Enable extended thinking and allocate this many tokens for it.
+   * Set to 0 or omit to disable.
+   */
+  thinkingBudgetTokens?: number
+  /**
+   * Hard cost ceiling (USD). The engine aborts once estimated cost exceeds
+   * this value. 0 or undefined means no limit.
+   */
+  maxCostUsd?: number
+  /**
+   * Sandbox state injected into `appState` so that BashTool and other
+   * tools can access the resolved sandbox configuration at invocation time.
+   *
+   * Shape: `{ sandboxRuntimeConfig, sandboxMode }`
+   */
+  sandboxState?: Record<string, unknown>
+  /**
+   * Lifecycle hooks loaded from project configuration.
+   * When provided, PreToolUse and PostToolUse hooks are executed around
+   * each tool invocation.
+   */
+  hooks?: HookDefinition[]
+  /**
+   * Whether the engine is running in an interactive mode (TTY / REPL).
+   * When `false` (default), tools that return `{ behavior: 'ask' }` are
+   * treated as denied because there is no user present to confirm.
+   * When `true`, `ask` results are resolved via `approvalCallback`.
+   *
+   * TODO: In interactive mode, `ask` should emit a `tool:approval_needed`
+   * event and pause execution until the REPL layer collects user confirmation.
+   * This wiring is a separate concern and not yet implemented.
+   */
+  isInteractive?: boolean
+  /**
+   * Callback to request user approval for tools that return 'ask'.
+   * Should return true if approved, false if denied.
+   * Required when `isInteractive` is true for proper approval flow.
+   */
+  approvalCallback?: (toolName: string, input: Record<string, unknown>) => Promise<boolean>
+}
+
+export interface QueryEngineState {
+  /** Current engine status. */
+  status: 'idle' | 'running' | 'aborting' | 'error'
+  /** Full conversation transcript. */
+  messages: Message[]
+  /** Cumulative token usage for this engine instance. */
+  totalTokens: TokenUsage
+  /** Estimated cumulative cost in USD. */
+  estimatedCostUsd: number
+  /** Number of completed agentic turns in the current run. */
+  turnsCompleted: number
+  /** Maximum agentic turns before the engine stops. */
+  maxTurns: number
+  /** Model identifier in use. */
+  model: string
+  /** Session identifier. */
+  sessionId: string
+}
+
+export interface QueryResult {
+  /** The model's final textual response (concatenated text blocks). */
+  text: string
+  /** All content blocks from the final assistant message. */
+  content: ContentBlock[]
+  /** Why the model stopped generating. */
+  stopReason: string
+  /** Number of agentic turns consumed. */
+  turnsUsed: number
+  /** Token usage for this query. */
+  tokenUsage: TokenUsage
+  /** Estimated cost for this query (USD). */
+  costUsd: number
+  /** Wall-clock duration in milliseconds. */
+  durationMs: number
+  /** Set when the query ended due to an error. */
+  error?: Error
+}
+
+// ============================================================
+// Pricing Constants (approximate, for estimation only)
+// ============================================================
+
+const PRICING_PER_INPUT_TOKEN: Record<string, number> = {
+  'claude-sonnet-4-20250514': 3 / 1_000_000,
+  'claude-opus-4-20250514': 15 / 1_000_000,
+  'claude-3-5-sonnet-20241022': 3 / 1_000_000,
+  'claude-3-5-haiku-20241022': 1 / 1_000_000,
+}
+
+const PRICING_PER_OUTPUT_TOKEN: Record<string, number> = {
+  'claude-sonnet-4-20250514': 15 / 1_000_000,
+  'claude-opus-4-20250514': 75 / 1_000_000,
+  'claude-3-5-sonnet-20241022': 15 / 1_000_000,
+  'claude-3-5-haiku-20241022': 5 / 1_000_000,
+}
+
+const DEFAULT_INPUT_PRICE = 3 / 1_000_000
+const DEFAULT_OUTPUT_PRICE = 15 / 1_000_000
+
+const DEFAULT_MAX_TOKENS = 8192
+const DEFAULT_MAX_TURNS = 50
+
+/** Default timeout for tool execution (120 seconds). */
+const DEFAULT_TOOL_TIMEOUT_MS = 120_000
+/** Longer timeout for BashTool since commands can take a while. */
+const BASH_TOOL_TIMEOUT_MS = 300_000
+/** Shorter timeout for simple read-only tools. */
+const READ_TOOL_TIMEOUT_MS = 30_000
+
+/** Fraction of context window used as the auto-compact trigger threshold. */
+const CONTEXT_WINDOW_SAFETY_RATIO = 0.8
+/** Target ratio (of context window) for retained tokens after inline compaction. */
+const COMPACT_TARGET_RATIO = 0.5
+/** Aggressive target ratio for emergency compaction (prompt_too_long). */
+const EMERGENCY_COMPACT_TARGET_RATIO = 0.35
+
+// ============================================================
+// QueryEngine
+// ============================================================
+
+export class QueryEngine {
+  // ----------------------------------------------------------
+  // Instance State
+  // ----------------------------------------------------------
+
+  private readonly config: Required<
+    Pick<QueryEngineConfig, 'model' | 'maxTokens' | 'maxTurns'>
+  > &
+    QueryEngineConfig
+  private readonly apiClient: ProviderAdapter
+  private readonly emitter: EventEmitter
+
+  private abortController: AbortController
+  private state: QueryEngineState
+  private currentRunStart: number = 0
+
+  // ----------------------------------------------------------
+  // Constructor
+  // ----------------------------------------------------------
+
+  constructor(config: QueryEngineConfig) {
+    this.config = {
+      ...config,
+      maxTokens: config.maxTokens ?? DEFAULT_MAX_TOKENS,
+      maxTurns: config.maxTurns ?? DEFAULT_MAX_TURNS,
+    }
+
+    this.apiClient =
+      config.apiClient ??
+      createApiClient({
+        apiKey: config.apiKey,
+        baseUrl: config.baseUrl,
+        defaultModel: config.model,
+      })
+
+    this.emitter = new EventEmitter()
+    // Allow many listeners (e.g. UI + logger + analytics)
+    this.emitter.setMaxListeners(100)
+
+    this.abortController = new AbortController()
+
+    this.state = this.createInitialState()
+  }
+
+  /**
+   * Async factory: creates a QueryEngine with automatic provider detection.
+   *
+   * Use this instead of `new QueryEngine(config)` when you want multi-provider
+   * support (the constructor defaults to Anthropic for backward compatibility).
+   *
+   * @example
+   * ```ts
+   * const engine = await QueryEngine.create({
+   *   model: 'gpt-4o',
+   *   provider: 'openai',
+   *   // ... other config
+   * })
+   * ```
+   */
+  static async create(config: QueryEngineConfig & { provider?: 'anthropic' | 'openai' }): Promise<QueryEngine> {
+    if (config.apiClient) {
+      return new QueryEngine(config)
+    }
+
+    const adapter = await createProvider({
+      provider: config.provider,
+      apiKey: config.apiKey,
+      baseUrl: config.baseUrl,
+      defaultModel: config.model,
+    })
+
+    return new QueryEngine({ ...config, apiClient: adapter })
+  }
+
+  // ==========================================================
+  // Public API
+  // ==========================================================
+
+  /**
+   * Execute a full query cycle from a single user prompt.
+   *
+   * The engine enters the agentic loop: the model responds, tool calls are
+   * executed, results are fed back, and the cycle repeats until the model
+   * stops requesting tools or a limit is hit.
+   */
+  async run(prompt: string): Promise<QueryResult> {
+    if (this.state.status === 'running') {
+      throw new Error(
+        'A query is already in progress. Call abort() first to cancel it.',
+      )
+    }
+
+    this.resetForNewRun()
+    this.emit('state', { ...this.state })
+
+    // Append the user message
+    const userMessage = this.createMessage('user', prompt)
+    this.state.messages.push(userMessage)
+
+    return this.executeAgenticLoop()
+  }
+
+  /**
+   * Continue a conversation with an existing message history.
+   *
+   * Useful for SDK / headless callers that manage their own transcript and
+   * want the engine to pick up from where a previous run left off.
+   */
+  async runMultiTurn(messages: Message[]): Promise<QueryResult> {
+    if (this.state.status === 'running') {
+      throw new Error(
+        'A query is already in progress. Call abort() first to cancel it.',
+      )
+    }
+
+    this.resetForNewRun()
+
+    // Merge incoming messages into the transcript, avoiding duplicates
+    const existingIds = new Set(this.state.messages.map(m => m.id))
+    for (const msg of messages) {
+      if (!existingIds.has(msg.id)) {
+        this.state.messages.push(msg)
+      }
+    }
+
+    this.emit('state', { ...this.state })
+    return this.executeAgenticLoop()
+  }
+
+  /**
+   * Cancel the currently running query.
+   *
+   * The abort is cooperative: in-flight HTTP requests are cancelled and the
+   * agentic loop exits at the next check-point.
+   */
+  abort(): void {
+    if (this.state.status === 'running') {
+      this.state.status = 'aborting'
+      this.emit('state', { ...this.state })
+      this.abortController.abort()
+    }
+  }
+
+  /** Return a read-only snapshot of the current engine state. */
+  getState(): Readonly<QueryEngineState> {
+    return { ...this.state }
+  }
+
+  /** Access cumulative token usage. */
+  getUsage(): Readonly<TokenUsage> {
+    return this.apiClient.getUsage()
+  }
+
+  /** Access the underlying provider adapter (e.g. for AI compact summaries). */
+  getProvider(): ProviderAdapter {
+    return this.apiClient
+  }
+
+  /**
+   * Replace the system prompt at runtime.
+   *
+   * Used by `/reload-context` to refresh CLAUDE.md and other project
+   * context files without restarting the session.
+   */
+  updateSystemPrompt(systemPrompt: string): void {
+    (this.config as { systemPrompt: string }).systemPrompt = systemPrompt
+  }
+
+  /** Reset the engine to its initial state, clearing the transcript. */
+  reset(): void {
+    this.abort()
+    this.state = this.createInitialState()
+    this.apiClient.resetUsage()
+    this.abortController = new AbortController()
+    this.emit('state', { ...this.state })
+  }
+
+  /**
+   * Load a pre-existing message history into the engine without triggering
+   * an API call.
+   *
+   * Used by the `/resume` command to restore a prior session's context so
+   * the next `run()` call continues from where the old session left off.
+   *
+   * @param messages — ordered conversation history (oldest first).
+   */
+  loadHistory(messages: Message[]): void {
+    this.state.messages = [...messages]
+    this.emit('state', { ...this.state })
+  }
+
+  /**
+   * Run an isolated sub-agent query using a fresh engine instance.
+   *
+   * Creates a child QueryEngine that shares the same API client but has
+   * its own conversation, tool subset, system prompt, and event emitter.
+   * The child's events are NOT forwarded to the parent — the caller
+   * observes progress via the returned QueryResult.
+   *
+   * This avoids the impedance mismatch between the low-level `query()`
+   * function (which expects raw Anthropic streaming events via
+   * `ClaudeApiDeps`) and the high-level `ClaudeApiClient.stream()` that
+   * the engine already wraps.
+   */
+  async runIsolated(options: {
+    prompt: string
+    systemPrompt: string
+    toolNames?: string[]
+    model?: string
+    maxTokens?: number
+    maxTurns?: number
+    parentAbortSignal?: AbortSignal
+  }): Promise<QueryResult> {
+    // Filter tools to the allowed subset
+    let childTools = this.config.tools
+    if (options.toolNames && options.toolNames.length > 0) {
+      const allowSet = new Set(options.toolNames)
+      childTools = this.config.tools.filter(t => allowSet.has(t.name))
+    }
+
+    // Create a child config with overrides
+    const childConfig: QueryEngineConfig = {
+      ...this.config,
+      systemPrompt: options.systemPrompt,
+      tools: childTools,
+      model: options.model ?? this.config.model,
+      maxTokens: options.maxTokens ?? this.config.maxTokens,
+      maxTurns: options.maxTurns ?? 20,
+      // Share the same API client so usage is tracked globally
+      apiClient: this.apiClient,
+    }
+
+    const childEngine = new QueryEngine(childConfig)
+
+    // Link parent abort to child
+    if (options.parentAbortSignal) {
+      options.parentAbortSignal.addEventListener(
+        'abort',
+        () => childEngine.abort(),
+        { once: true },
+      )
+    }
+
+    return childEngine.run(options.prompt)
+  }
+
+  // ----------------------------------------------------------
+  // Event Subscription
+  // ----------------------------------------------------------
+
+  on<E extends keyof QueryEngineEvents>(
+    event: E,
+    listener: QueryEngineEvents[E],
+  ): this {
+    this.emitter.on(event, listener as (...args: unknown[]) => void)
+    return this
+  }
+
+  once<E extends keyof QueryEngineEvents>(
+    event: E,
+    listener: QueryEngineEvents[E],
+  ): this {
+    this.emitter.once(event, listener as (...args: unknown[]) => void)
+    return this
+  }
+
+  off<E extends keyof QueryEngineEvents>(
+    event: E,
+    listener: QueryEngineEvents[E],
+  ): this {
+    this.emitter.off(event, listener as (...args: unknown[]) => void)
+    return this
+  }
+
+  removeAllListeners(event?: keyof QueryEngineEvents): this {
+    this.emitter.removeAllListeners(event)
+    return this
+  }
+
+  // ==========================================================
+  // Private: Agentic Loop
+  // ==========================================================
+
+  /**
+   * Core execution loop. Streams model responses, dispatches tool calls,
+   * and iterates until completion or a guard-rail triggers.
+   */
+  private async executeAgenticLoop(): Promise<QueryResult> {
+    this.state.status = 'running'
+    this.currentRunStart = Date.now()
+    this.emit('state', { ...this.state })
+
+    const runTokenSnapshot: TokenUsage = { ...this.apiClient.getUsage() }
+    let finalText = ''
+    let finalContent: ContentBlock[] = []
+    let stopReason = ''
+    let runError: Error | undefined
+
+    // ── Loop detection state ────────────────────────────────────────────
+    // Track recent tool call signatures to detect repetition loops.
+    const recentToolSignatures: string[] = []
+    let consecutiveToolOnlyTurns = 0
+    const MAX_REPEATED_TOOL_CALLS = 3
+    const MAX_TOOL_ONLY_TURNS = 8
+    const RECENT_HISTORY_SIZE = 10
+
+    try {
+      while (this.state.turnsCompleted < this.config.maxTurns) {
+        // Check abort
+        if (this.abortController.signal.aborted) {
+          stopReason = 'aborted'
+          break
+        }
+
+        // ── Context window management ──────────────────────────────────
+        // Strip thinking blocks from older turns to slow context growth.
+        this.stripOldThinkingBlocks()
+
+        // Check if we're approaching the context window limit.
+        const contextWindow = getEffectiveContextWindowSize(this.config.model)
+        const estimatedTokens = this.estimateCurrentTokens()
+        if (estimatedTokens > contextWindow * CONTEXT_WINDOW_SAFETY_RATIO) {
+          this.performInlineCompact(false)
+        }
+
+        // Stream one model response
+        const assistantBlocks = await this.collectModelResponse()
+
+        // Extract text and tool_use blocks
+        const textParts: string[] = []
+        const toolUseBlocks: ToolUseBlock[] = []
+
+        for (const block of assistantBlocks) {
+          if (block.type === 'text') {
+            textParts.push((block as { text: string }).text)
+          } else if (block.type === 'tool_use') {
+            toolUseBlocks.push(block as ToolUseBlock)
+          }
+        }
+
+        // ── Loop detection: track text vs tool-only turns ─────────────
+        if (textParts.length > 0 && textParts.join('').trim().length > 0) {
+          consecutiveToolOnlyTurns = 0 // Reset — model produced text
+        } else if (toolUseBlocks.length > 0) {
+          consecutiveToolOnlyTurns += 1
+        }
+
+        // Record the assistant turn in the transcript
+        const assistantMessage = this.createMessage('assistant', assistantBlocks)
+        this.state.messages.push(assistantMessage)
+
+        // If no tool calls, the model is done
+        if (toolUseBlocks.length === 0) {
+          finalText = textParts.join('')
+          finalContent = assistantBlocks
+          stopReason = stopReason || 'end_turn'
+          break
+        }
+
+        // ── Loop detection: repeated tool calls ───────────────────────
+        // Build signatures for this batch of tool calls.
+        const batchSignatures = toolUseBlocks.map(
+          (tc) => `${tc.name}:${JSON.stringify(tc.input).slice(0, 200)}`,
+        )
+        recentToolSignatures.push(...batchSignatures)
+        if (recentToolSignatures.length > RECENT_HISTORY_SIZE) {
+          recentToolSignatures.splice(0, recentToolSignatures.length - RECENT_HISTORY_SIZE)
+        }
+
+        // Check for repeated identical tool calls (3+ in a row).
+        if (recentToolSignatures.length >= MAX_REPEATED_TOOL_CALLS) {
+          const last = recentToolSignatures[recentToolSignatures.length - 1]
+          const allSame = recentToolSignatures
+            .slice(-MAX_REPEATED_TOOL_CALLS)
+            .every((s) => s === last)
+
+          if (allSame) {
+            stopReason = 'loop_detected'
+            finalText = textParts.join('') ||
+              `[Execution stopped: the model called "${toolUseBlocks[0]?.name}" with identical arguments ${MAX_REPEATED_TOOL_CALLS} times in a row. This usually indicates a loop. Please rephrase your question or break the task into smaller steps.]`
+            finalContent = assistantBlocks
+            this.emit('text', `\n${finalText}\n`)
+            break
+          }
+        }
+
+        // ── Loop detection: too many consecutive tool-only turns ──────
+        if (consecutiveToolOnlyTurns >= MAX_TOOL_ONLY_TURNS) {
+          stopReason = 'loop_detected'
+          finalText =
+            `[Execution stopped: ${MAX_TOOL_ONLY_TURNS} consecutive turns with only tool calls and no text response. ` +
+            `The model appears to be going in circles. Try rephrasing your question or breaking the task into smaller steps.]`
+          finalContent = assistantBlocks
+          this.emit('text', `\n${finalText}\n`)
+          break
+        }
+
+        // Execute tool calls and record results
+        const toolResultBlocks = await this.executeToolBatch(
+          toolUseBlocks,
+          assistantMessage,
+        )
+
+        const resultsMessage = this.createMessage('user', toolResultBlocks)
+        this.state.messages.push(resultsMessage)
+
+        this.state.turnsCompleted += 1
+        this.syncUsage()
+        this.emit('state', { ...this.state })
+
+        // Cost guard
+        if (
+          this.config.maxCostUsd &&
+          this.config.maxCostUsd > 0 &&
+          this.state.estimatedCostUsd >= this.config.maxCostUsd
+        ) {
+          stopReason = 'max_cost_reached'
+          finalText =
+            textParts.join('') ||
+            '[Execution stopped: estimated cost exceeded the configured limit.]'
+          finalContent = assistantBlocks
+          break
+        }
+      }
+
+      // Turn limit guard
+      if (
+        this.state.turnsCompleted >= this.config.maxTurns &&
+        stopReason === ''
+      ) {
+        stopReason = 'max_turns_reached'
+        finalText =
+          finalText ||
+          `[Execution stopped: maximum agentic turns (${this.config.maxTurns}) reached.]`
+      }
+    } catch (err) {
+      runError = err instanceof Error ? err : new Error(String(err))
+      stopReason = 'error'
+      this.state.status = 'error'
+      this.emit('error', runError)
+    }
+
+    // Finalise
+    if (this.state.status === 'running') {
+      this.state.status = 'idle'
+    }
+
+    const runUsage: TokenUsage = {
+      inputTokens: this.apiClient.getUsage().inputTokens - runTokenSnapshot.inputTokens,
+      outputTokens:
+        this.apiClient.getUsage().outputTokens - runTokenSnapshot.outputTokens,
+      cacheCreationTokens:
+        this.apiClient.getUsage().cacheCreationTokens -
+        runTokenSnapshot.cacheCreationTokens,
+      cacheReadTokens:
+        this.apiClient.getUsage().cacheReadTokens -
+        runTokenSnapshot.cacheReadTokens,
+      requestCount:
+        this.apiClient.getUsage().requestCount - runTokenSnapshot.requestCount,
+    }
+
+    const result: QueryResult = {
+      text: finalText,
+      content: finalContent,
+      stopReason,
+      turnsUsed: this.state.turnsCompleted,
+      tokenUsage: runUsage,
+      costUsd: this.state.estimatedCostUsd,
+      durationMs: Date.now() - this.currentRunStart,
+      error: runError,
+    }
+
+    this.emit('done', result)
+    this.emit('state', { ...this.state })
+
+    return result
+  }
+
+  // ----------------------------------------------------------
+  // Private: Model Interaction
+  // ----------------------------------------------------------
+
+  /**
+   * Stream a single model response and collect all content blocks.
+   *
+   * Returns the ordered list of content blocks the model produced.
+   *
+   * Tool input arrives as a stream of `tool_input_delta` events that must
+   * be accumulated per content-block index and parsed into a JSON object
+   * once the response is complete.  This method maintains per-index
+   * accumulators to handle responses with multiple tool calls.
+   */
+  private async collectModelResponse(): Promise<ContentBlock[]> {
+    const blocks: ContentBlock[] = []
+
+    /**
+     * Per-index tracking for tool_use blocks.
+     *
+     * The Anthropic streaming API assigns each content block a sequential
+     * index (0, 1, 2, ...).  When a `content_block_start` fires for a
+     * tool_use block we register a tracker keyed by that index.  Subsequent
+     * `input_json_delta` events carry the same index so we can accumulate
+     * the partial JSON correctly even when multiple tool calls are
+     * interleaved with text blocks.
+     */
+    interface ToolTracker {
+      id: string
+      name: string
+      rawInput: string
+    }
+    const toolTrackers = new Map<number, ToolTracker>()
+    /** Monotonically increasing counter for the next block index. */
+    let nextBlockIndex = 0
+
+    const streamOptions: StreamOptions = {
+      model: this.config.model,
+      maxTokens: this.config.maxTokens,
+      temperature: this.config.temperature,
+      abortSignal: this.abortController.signal,
+      thinkingBudgetTokens: this.config.thinkingBudgetTokens,
+    }
+
+    // Set up an abort watcher that will break us out of the streaming loop
+    // even when the async generator itself doesn't check the signal.
+    let abortedDuringStream = false
+    const onAbortDuringStream = () => { abortedDuringStream = true }
+    streamOptions.abortSignal?.addEventListener('abort', onAbortDuringStream, { once: true })
+
+    try {
+    const streamIter = this.apiClient.stream(
+      this.state.messages,
+      this.config.systemPrompt,
+      this.config.tools,
+      streamOptions,
+    )[Symbol.asyncIterator]()
+
+    while (true) {
+      // Race the next event against the abort signal so we don't get stuck
+      // waiting for a generator that doesn't respect abort.
+      const iterResult = abortedDuringStream
+        ? { done: true as const, value: undefined }
+        : await Promise.race([
+            streamIter.next(),
+            new Promise<{ done: true; value: undefined }>((resolve) => {
+              const checkAbort = () => resolve({ done: true, value: undefined })
+              if (streamOptions.abortSignal?.aborted) { checkAbort(); return }
+              streamOptions.abortSignal?.addEventListener('abort', checkAbort, { once: true })
+            }),
+          ])
+      if (iterResult.done) break
+      const event = iterResult.value
+      switch (event.type) {
+        case 'text':
+          this.emit('text', event.content)
+          // Coalesce consecutive text deltas into a single block.
+          if (
+            blocks.length > 0 &&
+            blocks[blocks.length - 1]!.type === 'text'
+          ) {
+            const last = blocks[blocks.length - 1] as { type: 'text'; text: string }
+            last.text += event.content
+          } else {
+            blocks.push({ type: 'text', text: event.content })
+            nextBlockIndex++
+          }
+          break
+
+        case 'tool_use': {
+          const blockIdx = nextBlockIndex++
+          toolTrackers.set(blockIdx, {
+            id: event.toolUse.id,
+            name: event.toolUse.name,
+            rawInput: '',
+          })
+          this.emit('tool:use', event.toolUse)
+          break
+        }
+
+        case 'tool_input_delta': {
+          const tracker = toolTrackers.get(event.index)
+          if (tracker) {
+            tracker.rawInput += event.partialJson
+            this.emit('tool:input_delta', {
+              toolUseId: tracker.id,
+              partialJson: event.partialJson,
+            })
+          }
+          break
+        }
+
+        case 'thinking':
+          this.emit('thinking', event.content)
+          if (
+            blocks.length > 0 &&
+            blocks[blocks.length - 1]!.type === 'thinking'
+          ) {
+            const last = blocks[blocks.length - 1] as {
+              type: 'thinking'
+              thinking: string
+            }
+            last.thinking += event.content
+          } else {
+            blocks.push({ type: 'thinking', thinking: event.content })
+            nextBlockIndex++
+          }
+          break
+
+        case 'done':
+          break
+
+        case 'error':
+          throw event.error
+      }
+    }
+    } catch (streamErr) {
+      // If the error is a context overflow (prompt_too_long), attempt
+      // emergency compaction and retry the request once.
+      if (this.isContextOverflowError(streamErr)) {
+        this.performInlineCompact(true)
+        // Clear partial state and retry the stream
+        blocks.length = 0
+        toolTrackers.clear()
+        nextBlockIndex = 0
+
+        for await (const event of this.apiClient.stream(
+          this.state.messages,
+          this.config.systemPrompt,
+          this.config.tools,
+          streamOptions,
+        )) {
+          if (event.type === 'text') {
+            this.emit('text', event.content)
+            if (blocks.length > 0 && blocks[blocks.length - 1]!.type === 'text') {
+              (blocks[blocks.length - 1] as { type: 'text'; text: string }).text += event.content
+            } else {
+              blocks.push({ type: 'text', text: event.content })
+              nextBlockIndex++
+            }
+          } else if (event.type === 'tool_use') {
+            const blockIdx = nextBlockIndex++
+            toolTrackers.set(blockIdx, { id: event.toolUse.id, name: event.toolUse.name, rawInput: '' })
+            this.emit('tool:use', event.toolUse)
+          } else if (event.type === 'tool_input_delta') {
+            const tracker = toolTrackers.get(event.index)
+            if (tracker) { tracker.rawInput += event.partialJson; this.emit('tool:input_delta', { toolUseId: tracker.id, partialJson: event.partialJson }) }
+          } else if (event.type === 'thinking') {
+            this.emit('thinking', event.content)
+            if (blocks.length > 0 && blocks[blocks.length - 1]!.type === 'thinking') {
+              (blocks[blocks.length - 1] as { type: 'thinking'; thinking: string }).thinking += event.content
+            } else { blocks.push({ type: 'thinking', thinking: event.content }); nextBlockIndex++ }
+          } else if (event.type === 'error') { throw event.error }
+        }
+      } else {
+        throw streamErr
+      }
+    }
+
+    // Post-stream: finalise all tracked tool_use blocks by parsing the
+    // accumulated JSON input and appending the blocks in index order.
+    const sortedIndices = [...toolTrackers.keys()].sort((a, b) => a - b)
+    for (const idx of sortedIndices) {
+      const tracker = toolTrackers.get(idx)!
+      let input: Record<string, unknown> = {}
+      try {
+        input = tracker.rawInput.length > 0 ? JSON.parse(tracker.rawInput) : {}
+      } catch {
+        // Malformed JSON — pass the raw string so the tool can decide
+        // how to handle it.
+        input = { _raw: tracker.rawInput }
+      }
+
+      blocks.push({
+        type: 'tool_use',
+        id: tracker.id,
+        name: tracker.name,
+        input,
+      } as ToolUseBlock)
+    }
+
+    return blocks
+  }
+
+  // ----------------------------------------------------------
+  // Private: Tool Execution
+  // ----------------------------------------------------------
+
+  /**
+   * Execute a batch of tool calls.
+   *
+   * Processes the batch in order, grouping CONSECUTIVE concurrency-safe tools
+   * into parallel batches while preserving the original order relative to
+   * non-safe tools.  This avoids reordering side effects: e.g.
+   * [read, write, read] stays in that order rather than becoming
+   * [read, read] concurrent then [write] sequential.
+   */
+  private async executeToolBatch(
+    toolUseBlocks: ToolUseBlock[],
+    parentMessage: Message,
+  ): Promise<ToolResultBlock[]> {
+    const permissions = await this.checkToolPermissions(toolUseBlocks)
+    const results: ToolResultBlock[] = []
+
+    // Group consecutive concurrency-safe tools into parallel batches,
+    // while preserving the original order relative to non-safe tools.
+    let i = 0
+    while (i < toolUseBlocks.length) {
+      const block = toolUseBlocks[i]!
+      const perm = permissions.get(block.id)
+
+      // Handle denied tools (add deny result).
+      if (perm?.behavior === 'deny') {
+        results.push(this.errorResult(block.id, perm.message ?? `Permission denied for "${block.name}"`))
+        i++
+        continue
+      }
+
+      // In non-interactive mode, 'ask' cannot be resolved — treat as deny.
+      if (perm?.behavior === 'ask' && !this.config.isInteractive) {
+        results.push(this.errorResult(
+          block.id,
+          `Tool requires user confirmation but running in non-interactive mode`,
+        ))
+        i++
+        continue
+      }
+
+      // In interactive mode, 'ask' requires user approval via callback.
+      if (perm?.behavior === 'ask' && this.config.isInteractive) {
+        this.emit('tool:approval_needed', { toolUseId: block.id, toolName: block.name, input: block.input })
+        if (this.config.approvalCallback) {
+          const approved = await this.config.approvalCallback(block.name, block.input)
+          if (!approved) {
+            results.push(this.errorResult(block.id, `User denied tool "${block.name}"`))
+            i++
+            continue
+          }
+        } else {
+          // No callback registered — deny to maintain fail-closed security
+          results.push(this.errorResult(block.id, `Tool "${block.name}" requires user confirmation but no approval callback is configured`))
+          i++
+          continue
+        }
+      }
+
+      const tool = this.findTool(block.name)
+      if (!tool) {
+        results.push(this.errorResult(block.id, `Unknown tool: "${block.name}"`))
+        i++
+        continue
+      }
+
+      // Collect consecutive concurrency-safe tools.
+      if (tool.isConcurrencySafe(block.input) && toolUseBlocks.length > 1) {
+        const batch: Array<{ block: ToolUseBlock; tool: ToolInstance }> = [{ block, tool }]
+        let j = i + 1
+        while (j < toolUseBlocks.length) {
+          const nextBlock = toolUseBlocks[j]!
+          const nextPerm = permissions.get(nextBlock.id)
+          // Stop at denied tools — they need inline error results.
+          if (nextPerm?.behavior === 'deny') break
+          // Stop at ask-in-non-interactive — same treatment as deny.
+          if (nextPerm?.behavior === 'ask' && !this.config.isInteractive) break
+          // Stop at ask-in-interactive — requires sequential user approval.
+          if (nextPerm?.behavior === 'ask' && this.config.isInteractive) break
+          const nextTool = this.findTool(nextBlock.name)
+          if (!nextTool || !nextTool.isConcurrencySafe(nextBlock.input)) break
+          batch.push({ block: nextBlock, tool: nextTool })
+          j++
+        }
+
+        // Execute the consecutive safe batch in parallel.
+        if (batch.length > 1) {
+          const settled = await Promise.allSettled(
+            batch.map(({ block: b, tool: t }) => this.executeSingleTool(b, t, parentMessage))
+          )
+          for (const [k, outcome] of settled.entries()) {
+            results.push(this.settleToResult(outcome, batch[k]!.block))
+          }
+          i = j
+          continue
+        }
+      }
+
+      // Single tool execution (non-safe or alone).
+      try {
+        const result = await this.executeSingleTool(block, tool, parentMessage)
+        results.push(result)
+      } catch (err) {
+        results.push(this.errorResult(block.id, err instanceof Error ? err.message : String(err)))
+      }
+      i++
+    }
+
+    return results
+  }
+
+  /**
+   * Run permission checks for every tool call in the batch.
+   *
+   * Precedence:
+   *   1. Deny-list ALWAYS wins (checked first).
+   *   2. The tool's own `checkPermissions` is ALWAYS invoked.
+   *   3. If the tool says "deny", we respect it regardless of allowList.
+   *   4. If the tool says "ask" and the tool is on the allowList, we
+   *      upgrade to "allow" (allowList can skip "asking" but cannot
+   *      override "denying").
+   *   5. Otherwise the tool's own verdict is used as-is.
+   */
+  private async checkToolPermissions(
+    toolUseBlocks: ToolUseBlock[],
+  ): Promise<Map<string, PermissionResult>> {
+    const results = new Map<string, PermissionResult>()
+
+    for (const block of toolUseBlocks) {
+      const tool = this.findTool(block.name)
+
+      if (!tool) {
+        results.set(block.id, {
+          behavior: 'deny',
+          message: `Unknown tool: "${block.name}"`,
+        })
+        continue
+      }
+
+      // 1. Deny-list ALWAYS wins — checked first
+      if (this.config.permissionContext.denyList.includes(tool.name)) {
+        results.set(block.id, {
+          behavior: 'deny',
+          message: `Tool "${tool.name}" is on the deny list`,
+        })
+        continue
+      }
+
+      // 2. ALWAYS run the tool's own checkPermissions
+      let toolPerm: PermissionResult
+      try {
+        toolPerm = await tool.checkPermissions(
+          block.input,
+          this.config.permissionContext,
+        )
+      } catch (err) {
+        results.set(block.id, {
+          behavior: 'deny',
+          message: `Permission check failed: ${err instanceof Error ? err.message : String(err)}`,
+        })
+        continue
+      }
+
+      // 3. Tool says deny → respect it, regardless of allowList
+      if (toolPerm.behavior === 'deny') {
+        results.set(block.id, toolPerm)
+        continue
+      }
+
+      // 4. Tool says ask + allowList includes tool → upgrade to allow
+      //    (allowList can skip "asking" but CANNOT override "denying")
+      if (toolPerm.behavior === 'ask' && this.config.permissionContext.allowList.includes(tool.name)) {
+        results.set(block.id, { behavior: 'allow' })
+        continue
+      }
+
+      // 5. Use tool's verdict as-is
+      results.set(block.id, toolPerm)
+    }
+
+    return results
+  }
+
+  /**
+   * Execute a single tool call by delegating to the shared `executeToolCall`
+   * function in `utils/toolExecutor.ts`.
+   *
+   * The QueryEngine wraps the shared executor with:
+   *   - `tool:use` event emission before execution
+   *   - `tool:result` event emission after execution
+   *   - A progress callback that triggers state-update events
+   *   - The QueryEngine's own tool context (with sub-agent factory, etc.)
+   */
+  private async executeSingleTool(
+    block: ToolUseBlock,
+    tool: ToolInstance,
+    parentMessage: Message,
+  ): Promise<ToolResultBlock> {
+    this.emit('tool:use', block)
+
+    const context = this.buildToolContext()
+
+    // Build a permission checker that applies deny/allow-list rules
+    // before delegating to the tool's own checkPermissions.
+    const canUseTool = buildPermissionChecker(this.config.permissionContext)
+
+    const hooks = this.config.hooks ?? []
+
+    // Determine timeout based on tool type.
+    const timeoutMs = block.name === 'Bash'
+      ? BASH_TOOL_TIMEOUT_MS
+      : (block.name === 'FileRead' || block.name === 'Glob' || block.name === 'Grep')
+        ? READ_TOOL_TIMEOUT_MS
+        : DEFAULT_TOOL_TIMEOUT_MS
+
+    // Wrap tool execution with a timeout to prevent indefinite hangs.
+    const resultBlock = await Promise.race([
+      executeToolCall(
+        block,
+        tool,
+        context,
+        parentMessage,
+        canUseTool,
+        hooks,
+        {
+          checkEnabled: true,
+          onProgress: (_progress) => {
+            this.emit('state', { ...this.state })
+          },
+        },
+      ),
+      new Promise<ToolResultBlock>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`Tool "${block.name}" timed out after ${Math.round(timeoutMs / 1000)}s`)),
+          timeoutMs,
+        ),
+      ),
+    ])
+
+    // ── Post-edit auto-verification ──────────────────────────────────
+    if (
+      (block.name === 'FileEdit' || block.name === 'FileWrite') &&
+      !resultBlock.is_error
+    ) {
+      try {
+        const filePath = extractFilePathFromToolInput(block.name, block.input ?? {})
+        if (filePath) {
+          const verification = await verifyFileAfterEdit(filePath)
+          const note = formatVerificationNote(verification)
+          if (note && typeof resultBlock.content === 'string') {
+            resultBlock.content = resultBlock.content + note
+          }
+        }
+      } catch {
+        // Verification failure is non-fatal — don't block the agent.
+      }
+    }
+
+    this.emit('tool:result', resultBlock)
+    return resultBlock
+  }
+
+  // ----------------------------------------------------------
+  // Private: Context Construction
+  // ----------------------------------------------------------
+
+  /**
+   * Build the ToolUseContext that tools receive at invocation time.
+   *
+   * The `appState.subAgentRunner` factory allows the AgentTool to spawn
+   * isolated sub-agent queries without needing direct access to the
+   * low-level ClaudeApiDeps interface.
+   */
+  private buildToolContext(): ToolUseContext {
+    return {
+      tools: this.config.tools,
+      permissionContext: this.config.permissionContext,
+      cwd: this.config.cwd,
+      sessionId: this.config.sessionId,
+      abortController: this.abortController,
+      mcpClients: new Map(),
+      appState: {
+        // Expose a sub-agent runner factory so AgentTool.runAgent can
+        // create isolated child engines without touching ClaudeApiDeps.
+        subAgentRunner: (options: {
+          prompt: string
+          systemPrompt: string
+          toolNames?: string[]
+          model?: string
+          maxTokens?: number
+          maxTurns?: number
+        }) => this.runIsolated({
+          ...options,
+          parentAbortSignal: this.abortController.signal,
+        }),
+        // Spread sandbox state (sandboxRuntimeConfig, sandboxMode, sandbox)
+        // so that BashTool can access it via context.appState.
+        ...(this.config.sandboxState ?? {}),
+        // Expose hooks so sub-agents can also run PreToolUse/PostToolUse hooks.
+        hooks: this.config.hooks,
+      },
+      messages: [...this.state.messages],
+      renderedSystemPrompt: this.config.systemPrompt,
+    }
+  }
+
+  // ----------------------------------------------------------
+  // Private: State & Accounting
+  // ----------------------------------------------------------
+
+  private createInitialState(): QueryEngineState {
+    return {
+      status: 'idle',
+      messages: [],
+      totalTokens: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 0,
+        requestCount: 0,
+      },
+      estimatedCostUsd: 0,
+      turnsCompleted: 0,
+      maxTurns: this.config.maxTurns,
+      model: this.config.model,
+      sessionId: this.config.sessionId,
+    }
+  }
+
+  private resetForNewRun(): void {
+    this.abortController = new AbortController()
+    this.state.status = 'running'
+    this.state.turnsCompleted = 0
+    this.state.estimatedCostUsd = 0
+  }
+
+  /** Pull latest usage from the API client and update cost estimate. */
+  private syncUsage(): void {
+    const usage = this.apiClient.getUsage()
+    this.state.totalTokens = { ...usage }
+    this.state.estimatedCostUsd = this.calculateCost(usage)
+    this.emit('usage', { ...usage })
+  }
+
+  /**
+   * Estimate cost in USD based on token usage and the current model.
+   */
+  private calculateCost(usage: TokenUsage): number {
+    const inputPrice =
+      PRICING_PER_INPUT_TOKEN[this.config.model] ?? DEFAULT_INPUT_PRICE
+    const outputPrice =
+      PRICING_PER_OUTPUT_TOKEN[this.config.model] ?? DEFAULT_OUTPUT_PRICE
+
+    return usage.inputTokens * inputPrice + usage.outputTokens * outputPrice
+  }
+
+  // ----------------------------------------------------------
+  // Private: Message Helpers
+  // ----------------------------------------------------------
+
+  private createMessage(
+    role: 'user' | 'assistant',
+    content: string | ContentBlock[],
+    parentUuid?: string,
+  ): Message {
+    return {
+      id: randomUUID(),
+      uuid: randomUUID(),
+      role,
+      content,
+      timestamp: Date.now(),
+      parentUuid,
+      model: role === 'assistant' ? this.config.model : undefined,
+    }
+  }
+
+  private findTool(name: string): ToolInstance | undefined {
+    return this.config.tools.find(t => t.name === name && t.isEnabled())
+  }
+
+  // ----------------------------------------------------------
+  // Private: Result Helpers
+  // ----------------------------------------------------------
+
+  private settleToResult(
+    outcome: PromiseSettledResult<ToolResultBlock>,
+    block: ToolUseBlock,
+  ): ToolResultBlock {
+    if (outcome.status === 'fulfilled') return outcome.value
+    return this.errorResult(
+      block.id,
+      outcome.reason instanceof Error
+        ? outcome.reason.message
+        : String(outcome.reason),
+    )
+  }
+
+  private errorResult(toolUseId: string, message: string): ToolResultBlock {
+    return {
+      type: 'tool_result',
+      tool_use_id: toolUseId,
+      content: message,
+      is_error: true,
+    }
+  }
+
+  // ----------------------------------------------------------
+  // Private: Context Management
+  // ----------------------------------------------------------
+
+  /**
+   * Estimate the total token count of all messages currently in the
+   * conversation transcript. Uses the CJK-aware heuristic from the
+   * compact service.
+   */
+  private estimateCurrentTokens(): number {
+    let total = estimateTokenCount(this.config.systemPrompt)
+    for (const msg of this.state.messages) {
+      if (typeof msg.content === 'string') {
+        total += estimateTokenCount(msg.content)
+        continue
+      }
+      for (const block of msg.content) {
+        if (block.type === 'text') {
+          total += estimateTokenCount((block as { text: string }).text)
+        } else if (block.type === 'thinking') {
+          total += estimateTokenCount((block as { thinking: string }).thinking)
+        } else if (block.type === 'tool_use') {
+          const tu = block as ToolUseBlock
+          total += estimateTokenCount(JSON.stringify(tu.input)) + estimateTokenCount(tu.name)
+        } else if (block.type === 'tool_result') {
+          const tr = block as ToolResultBlock
+          if (typeof tr.content === 'string') {
+            total += estimateTokenCount(tr.content)
+          } else if (Array.isArray(tr.content)) {
+            for (const inner of tr.content) {
+              if (inner.type === 'text') total += estimateTokenCount((inner as { text: string }).text)
+            }
+          }
+        }
+      }
+    }
+    return total
+  }
+
+  /**
+   * Run inline compaction on the conversation transcript.
+   *
+   * Triggered automatically when estimated tokens exceed the context window
+   * safety threshold, or as an emergency measure when the API rejects a
+   * request with `prompt_too_long`.
+   */
+  private performInlineCompact(aggressive = false): void {
+    const contextWindow = getEffectiveContextWindowSize(this.config.model)
+    const targetRatio = aggressive ? EMERGENCY_COMPACT_TARGET_RATIO : COMPACT_TARGET_RATIO
+    const targetTokens = Math.floor(contextWindow * targetRatio)
+
+    const { result, keptMessages } = compactConversation(
+      this.state.messages,
+      { targetTokens },
+    )
+
+    this.state.messages = keptMessages
+    this.emit('context:compact', {
+      messagesRemoved: result.messagesRemoved,
+      tokensBefore: result.tokenCountBefore,
+      tokensAfter: result.tokenCountAfter,
+    })
+  }
+
+  /**
+   * Strip thinking blocks from older assistant messages in the transcript.
+   *
+   * Extended thinking blocks can be very large (10K-50K tokens). When they
+   * accumulate across multiple turns and are re-sent to the API, they
+   * rapidly exhaust the context window. Only the most recent assistant
+   * message's thinking block is preserved — older ones are replaced with
+   * a short placeholder.
+   */
+  private stripOldThinkingBlocks(): void {
+    let lastAssistantIdx = -1
+    for (let i = this.state.messages.length - 1; i >= 0; i--) {
+      if (this.state.messages[i]!.role === 'assistant') {
+        lastAssistantIdx = i
+        break
+      }
+    }
+
+    for (let i = 0; i < this.state.messages.length; i++) {
+      if (i === lastAssistantIdx) continue
+      const msg = this.state.messages[i]!
+      if (msg.role !== 'assistant' || typeof msg.content === 'string') continue
+
+      let changed = false
+      const cleaned = (msg.content as ContentBlock[]).map(block => {
+        if (block.type === 'thinking') {
+          changed = true
+          return { type: 'text' as const, text: '[earlier reasoning omitted]' }
+        }
+        return block
+      })
+
+      if (changed) {
+        this.state.messages[i] = { ...msg, content: cleaned }
+      }
+    }
+  }
+
+  /**
+   * Detect whether an error indicates the prompt exceeded the model's
+   * context window (HTTP 400 with prompt_too_long / context_length).
+   */
+  private isContextOverflowError(err: unknown): boolean {
+    if (!err || typeof err !== 'object') return false
+    const e = err as Record<string, unknown>
+    const status = e['status'] ?? (e['statusCode'] as number | undefined)
+    if (status === 400) {
+      const msg = String(e['message'] ?? e['error'] ?? '')
+      return /prompt.*too.*long|context.*length|max.*context|token.*limit/i.test(msg)
+    }
+    return false
+  }
+
+  // ----------------------------------------------------------
+  // Private: Event Dispatch
+  // ----------------------------------------------------------
+
+  private emit<E extends keyof QueryEngineEvents>(
+    event: E,
+    ...args: Parameters<QueryEngineEvents[E]>
+  ): void {
+    this.emitter.emit(event, ...args)
+  }
+}
